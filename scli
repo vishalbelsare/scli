@@ -5,14 +5,14 @@ import atexit
 import base64
 import bisect
 import collections
-import contextlib
-import errno
+import hashlib
 import importlib
 import json
 import logging
 import os
 import pprint
 import re
+import resource
 import shlex
 import shutil
 import signal as signal_ipc
@@ -20,9 +20,14 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import urllib
+from abc import ABC, abstractmethod
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
+from pathlib import Path
 
 import urwid
+from urwid.widget.constants import BOX_SYMBOLS, BAR_SYMBOLS
 
 try:
     from urwid_readline import ReadlineEdit
@@ -36,27 +41,23 @@ except ImportError:
 # #############################################################################
 
 
-DATA_FOLDER = os.getenv('XDG_DATA_HOME', os.path.expanduser('~/.local/share'))
-CFG_FOLDER = os.getenv('XDG_CONFIG_HOME', os.path.expanduser('~/.config'))
+DATA_DIR = Path(os.getenv('XDG_DATA_HOME', '~/.local/share')).expanduser()
+CFG_DIR = Path(os.getenv('XDG_CONFIG_HOME', '~/.config')).expanduser()
 
-SIGNALCLI_LEGACY_FOLDER = os.path.join(CFG_FOLDER, 'signal')
-SIGNALCLI_LEGACY_DATA_FOLDER = os.path.join(SIGNALCLI_LEGACY_FOLDER, 'data')
-SIGNALCLI_LEGACY_ATTACHMENT_FOLDER = os.path.join(SIGNALCLI_LEGACY_FOLDER, 'attachments')
+SIGNALCLI_DIR = DATA_DIR / 'signal-cli'
+SIGNALCLI_DATA_DIR = SIGNALCLI_DIR / 'data'
+SIGNALCLI_ATTACHMENT_DIR = SIGNALCLI_DIR / 'attachments'
+SIGNALCLI_AVATARS_DIR = SIGNALCLI_DIR / 'avatars'
+SIGNALCLI_STICKERS_DIR = SIGNALCLI_DIR / 'stickers'
 
-SIGNALCLI_FOLDER = os.path.join(DATA_FOLDER, 'signal-cli')
-SIGNALCLI_DATA_FOLDER = os.path.join(SIGNALCLI_FOLDER, 'data')
-SIGNALCLI_ATTACHMENT_FOLDER = os.path.join(SIGNALCLI_FOLDER, 'attachments')
-SIGNALCLI_AVATARS_FOLDER = os.path.join(SIGNALCLI_FOLDER, 'avatars')
-SIGNALCLI_STICKERS_FOLDER = os.path.join(SIGNALCLI_FOLDER, 'stickers')
+SCLI_DATA_DIR = DATA_DIR / 'scli'
+SCLI_ATTACHMENT_DIR = SCLI_DATA_DIR / 'attachments'
+SCLI_HISTORY_FILE = SCLI_DATA_DIR / 'history'
+SCLI_CFG_FILE = CFG_DIR / 'sclirc'
+SCLI_LOG_FILE = SCLI_DATA_DIR / 'log'
 
-SCLI_DATA_FOLDER = os.path.join(DATA_FOLDER, 'scli')
-SCLI_ATTACHMENT_FOLDER = os.path.join(SCLI_DATA_FOLDER, 'attachments')
-SCLI_HISTORY_FILE = os.path.join(SCLI_DATA_FOLDER, 'history')
-SCLI_CFG_FILE = os.path.join(CFG_FOLDER, 'sclirc')
-SCLI_LOG_FILE = os.path.join(SCLI_DATA_FOLDER, 'log')
-
-SCLI_EXEC_FOLDER = os.path.dirname(os.path.realpath(__file__))
-SCLI_README_FILE = os.path.join(SCLI_EXEC_FOLDER, 'README.md')
+SCLI_EXEC_DIR = Path(__file__).resolve().parent
+SCLI_README_FILE = SCLI_EXEC_DIR / 'README.md'
 
 
 # #############################################################################
@@ -77,11 +78,20 @@ def get_nested(dct, *keys, default=None):
     return dct
 
 
+def intersperse(value, container):
+    it = iter(container)
+    with suppress(StopIteration):
+        yield next(it)
+    for item in it:
+        yield value
+        yield item
+
+
 def get_urls(txt):
     return re.findall(r'(https?://[^\s]+)', txt)
 
 
-def callf(cmd, rmap=None, background=False, **subprocess_kwargs):
+def proc_run(cmd, rmap=None, background=False, **subprocess_kwargs):
     if rmap:
         optionals = rmap.pop("_optionals", ())
         for key, val in rmap.items():
@@ -91,32 +101,27 @@ def callf(cmd, rmap=None, background=False, **subprocess_kwargs):
 
     if not subprocess_kwargs.get('shell'):
         cmd = shlex.split(cmd)
-    logging.debug('callf: `%s`', cmd)
+    logger.debug('proc_run: `%s`', cmd)
 
     if background:
         for arg in ('stdin', 'stdout', 'stderr'):
             subprocess_kwargs.setdefault(arg, subprocess.DEVNULL)
-        proc = subprocess.Popen(cmd, **subprocess_kwargs)
-        return proc
+        return subprocess.Popen(cmd, **subprocess_kwargs)
 
     subprocess_kwargs.setdefault('text', True)
     proc = subprocess.run(cmd, **subprocess_kwargs)
 
     if proc.returncode != 0:
-        logging.error(
-                'callf: %s: exit code: %d, stderr: %s',
+        logger.error(
+                'proc_run: %s: exit code: %d, stderr: %s',
                 proc.args,
                 proc.returncode,
                 proc.stderr
                 )
     elif proc.stdout:
-        logging.debug('callf: %s', proc.stdout)
+        logger.debug('proc_run: %s', proc.stdout)
 
     return proc
-
-
-def get_prog_dir():
-    return os.path.dirname(os.path.realpath(__file__))
 
 
 def get_version():
@@ -126,27 +131,51 @@ def get_version():
     Does not output the leading `v` if it's present in git tag's name.
     """
 
-    # Do not use `logging` in this function, as it's called before logging.basicConfig().
-    prog_dir = get_prog_dir()
-    git_dir = os.path.join(prog_dir, '.git')
+    git_dir = SCLI_EXEC_DIR / '.git'
     git_cmd = ['git', '--git-dir', git_dir, 'describe']
-    try:
+    with suppress(FileNotFoundError, subprocess.CalledProcessError):
         proc = subprocess.run(git_cmd, capture_output=True, check=True, text=True)
         return proc.stdout.strip('v\n')
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
 
-    version_file_path = os.path.join(prog_dir, 'VERSION')
+    version_file_path = SCLI_EXEC_DIR / 'VERSION'
     try:
         with open(version_file_path, encoding='utf-8') as f:
             version_str = f.readline()
     except OSError:
-        return '?'
+        return git_hash_file(__file__)[:8]  # Short SHA
     if not version_str.startswith('v'):
         # '$Format:...' - not a `git archive` (e.g. a manually dl'ed blob)
         # '%(..)' - `git archive` if git < 2.32
-        return '?'
+        return git_hash_file(__file__)[:8]  # Short SHA
     return version_str[1:]  # `git-describe`-like string
+
+
+def get_python_version():
+    # Equivalent of platform.python_version()
+    return '.'.join(str(d) for d in sys.version_info[:3])
+
+
+def git_hash_file(path, block_size=2**16):
+    """git-hash-object for a file.
+
+    Method description in <https://git-scm.com/book/en/v2/Git-Internals-Git-Objects#_object_storage>.
+
+    To find commits referencing an object's hash, use `git log --find-object=<hash>` (<https://stackoverflow.com/a/48590251>).
+    """
+    size = os.stat(path).st_size
+    header = f"blob {size}\0".encode()
+    hash_obj = hashlib.sha1()
+    hash_obj.update(header)
+    with open(path, 'rb') as fo:
+        # In Python 3.11, can use hashlib.file_digest()
+        # In Python 3.8, can use `while block := fo.read(…)`
+        for block in iter(lambda: fo.read(block_size), b''):
+            hash_obj.update(block)
+    return hash_obj.hexdigest()
+
+
+def prog_version_str():
+    return f"scli {get_version()}"
 
 
 def get_default_editor():
@@ -159,6 +188,16 @@ def get_default_editor():
         if ret is not None:
             return ret
     return ret
+
+
+def get_default_pager():
+    with suppress(KeyError):
+        return os.environ['PAGER']
+    for exe in ('pager', 'less', 'more'):
+        ret = shutil.which(exe)
+        if ret is not None:
+            return ret
+    return None
 
 
 PHONE_NUM_REGEX = re.compile('^\\+[1-9][0-9]{6,14}$')
@@ -189,20 +228,25 @@ PATH_RE = re.compile(
         """,
     re.VERBOSE,
 )
-def split_path(string):
+
+def partition_escaped(string):
+    """Split `string` in two using ' ' as a separator, and accounting for escaped or quoted space characters.
+
+    Similar to `str.partition(' ')`, except a *two*-tuple is returned (omitting the space separator character itself), and the first item may contain space if it is escaped with a backslash or is inside quotation marks.
+    """
     string = string.strip()
     if not string:
-        return ['', '']
+        return ('', '')
     re_match = PATH_RE.match(string)
     if not re_match:
-        return ['', string]
-    path = re_match.group()
-    if re_match.group(1):  # unquoted path
-        path = path.replace(r'\ ', ' ')
-    else:  # path in quotes
-        path = path.strip('\'"')
-    rest = string[re_match.end() :].strip()
-    return [path, rest] if rest else [path]
+        return (string, '')
+    match_str = re_match.group()
+    if re_match.group(1):  # unquoted match_str
+        match_str = match_str.replace(r'\ ', ' ')
+    else:  # match_str in quotes
+        match_str = match_str.strip('\'"')
+    rest = string[re_match.end() :].lstrip()
+    return (match_str, rest)
 
 
 def get_current_timestamp_ms():
@@ -293,6 +337,7 @@ def get_envelope_contact_id(envelope):
         or get_envelope_data_val(envelope, 'groupInfo', 'groupId')
         or get_nested(envelope, 'syncMessage', 'sentMessage', 'destination')
         or get_nested(envelope, 'typingMessage', 'groupId')
+        or envelope.get('sourceNumber')
         or envelope['source']
     )
 
@@ -330,7 +375,7 @@ def get_attachment_name(attachment):
         filename = attachment['filename']
         return filename if filename else attachment['contentType']
     else:
-        return os.path.basename(attachment)
+        return Path(attachment).name
 
 
 def get_attachment_path(attachment):
@@ -338,16 +383,14 @@ def get_attachment_path(attachment):
         aid = attachment['id']
     except TypeError:
         return attachment
-    received_attachment = os.path.join(SIGNALCLI_ATTACHMENT_FOLDER, aid)
-    if not os.path.exists(received_attachment):
-        received_attachment = os.path.join(SIGNALCLI_LEGACY_ATTACHMENT_FOLDER, aid)
-    return received_attachment
+    received_attachment = SIGNALCLI_ATTACHMENT_DIR / aid
+    return str(received_attachment)
 
 
 def get_sticker_file_path(sticker):
     dir_name = sticker['packId']
     file_name = str(sticker['stickerId'])
-    return os.path.join(SIGNALCLI_STICKERS_FOLDER, dir_name, file_name)
+    return str(SIGNALCLI_STICKERS_DIR / dir_name / file_name)
 
 
 def b64_to_bytearray(group_id):
@@ -358,97 +401,174 @@ def b64_to_hex_str(group_id):
     return base64.b64decode(group_id.encode()).hex()
 
 
+def hex_str_to_b64(hex_str):
+    return base64.b64encode(bytes.fromhex(hex_str)).decode()
+
 # #############################################################################
 # clipboard
 # #############################################################################
 
 
-class clip:
-    mime_order = ['image/png', 'image/jpeg', 'image/jpg', 'text/uri-list']
-    tempfile_prefix = '_scli-tmp.'
+class ClipGetBase(ABC):
+
+    @abstractmethod
+    def files_list(self):
+        """Return a list of files in clipboard."""
+
+    def _proc_run(self, *args, **kwargs):
+        """proc_run() with capture_output by default"""
+        kwargs.setdefault("capture_output", True)
+        return proc_run(*args, **kwargs)
+
+
+class ClipGetCmd(ClipGetBase):
+
+    def __init__(self, get_cmd):
+        self._get_cmd = get_cmd
+
+    def files_list(self):
+        return self._proc_run(self._get_cmd).stdout.splitlines()
+
+
+class ClipGetBlank(ClipGetBase):
+    def files_list(self):
+        return []
+
+
+class ClipGetTargets(ClipGetBase):
+
+    _MIME_TARGETS = (
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            "audio/aac",
+            "audio/mpeg",
+            "video/mp4",
+            )
+
+    _WRITE_FILE_PREFIX = "clipb_"
+
+    def __init__(
+            self,
+            get_target_cmd,
+            get_targets_list_cmd,
+            write_dir,
+            ):
+        self._get_target_cmd = get_target_cmd
+        self._get_targets_list_cmd = get_targets_list_cmd
+        self._write_dir = write_dir
+
+    def _list_available_targets(self):
+        return self._proc_run(
+                self._get_targets_list_cmd,
+                ).stdout.splitlines()
+
+    def _get_target_val(self, target_name, **subprocess_kwargs):
+        return self._proc_run(
+                f"{self._get_target_cmd} {target_name}",
+                **subprocess_kwargs,
+                ).stdout
 
     @staticmethod
-    def xrun(mime):
-        try:
-            proc = subprocess.run(
-                    ['xclip', '-selection', 'clipboard', '-t', mime, '-o'],
-                    capture_output=True,
-                    check=True,
+    def _parse_file_uri(file_uri):
+        return urllib.parse.unquote(
+                file_uri[len("file://"):]
+                )
+
+    def _write_target_content(self, target):
+        suffix = target.partition('/')[-1]
+        datetime_str = datetime.now().strftime('%Y-%m-%d_%H-%M-%S.%fZ')
+        file_path = Path(
+                self._write_dir,
+                f"{self._WRITE_FILE_PREFIX}{datetime_str}.{suffix}",
+                )
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, 'wb') as outf:
+            self._get_target_val(
+                    target,
+                    text=False,
+                    capture_output=False,
+                    stdout=outf,
                     )
-        except (OSError, subprocess.CalledProcessError):
-            return None
-        return proc.stdout
+        return str(file_path)
 
-    @staticmethod
-    def xrun_lines(mime):
-        out = clip.xrun(mime)
-        if out:
-            return out.decode('utf-8').split('\n')
-        return None
+    def files_list(self):
+        targets_avail = self._list_available_targets()
+        if "text/uri-list" in targets_avail:
+            uri_list = self._get_target_val("text/uri-list")
+            return [self._parse_file_uri(line) for line in uri_list.splitlines()]
+        for target in self._MIME_TARGETS:
+            if target in targets_avail:
+                return [self._write_target_content(target)]
+        return []
 
-    @staticmethod
-    def xfiles():
-        out = clip.xrun_lines('TARGETS')
-        if out is None:
-            return out
 
-        for otype in out:
-            for mtype in clip.mime_order:
-                if mtype == otype:
-                    if mtype.startswith('image/'):
-                        content = clip.xrun(mtype)
-                        suffix = '.' + mtype.split('/')[1]
-                        if cfg.save_history:
-                            clip_file_path = os.path.join(
-                                SCLI_ATTACHMENT_FOLDER,
-                                f"clipboard_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}{suffix}"
-                            )
-                            clip_file = open(clip_file_path, 'w+b')
-                        else:
-                            clip_file = tempfile.NamedTemporaryFile(
-                                mode='w+b',
-                                prefix=clip.tempfile_prefix,
-                                suffix=suffix,
-                                delete=False,
-                            )
-                        with clip_file:
-                            clip_file.write(content)
-                        return [clip_file.name]
-                    elif mtype == 'text/uri-list':
-                        content = clip.xrun_lines(mtype)
-                        return [x.replace('file://', '') for x in content[1:]]
+class ClipPut:
 
-        return None
+    def __init__(self, put_cmd):
+        self._put_cmd = put_cmd
 
-    @staticmethod
-    def xput(txt):
-        if not txt:
-            return
-        try:
-            proc = subprocess.Popen(
-                    ['xclip', '-selection', 'clipboard'],
-                    stdin=subprocess.PIPE,
-                    text=True,
-                    )
-        except OSError:
-            return
+    def put(self, text):
+        proc_run(
+                self._put_cmd,
+                input=text,
+                )
+
+
+class ClipPutBlank:
+    def put(self, text):
+        pass
+
+
+class Clip:
+
+    def __init__(self):
+        if cfg.clipboard_put_command:
+            put_cmd = cfg.clipboard_put_command
         else:
-            with proc:
-                proc.stdin.write(txt)
+            if shutil.which("wl-copy"):
+                put_cmd = "wl-copy"
+            elif shutil.which("xclip"):
+                put_cmd = "xclip -i -sel c"
+            else:
+                put_cmd = None
+                logger.warning("No clipboard copy command found; disabling copying to clipboard.")
+        self._clip_put = ClipPut(put_cmd) if put_cmd else ClipPutBlank()
 
-    @staticmethod
-    def put(txt):
-        cmd = cfg.clipboard_put_command
-        if cmd is None:
-            return clip.xput(txt)
-        return callf(cmd, {'%s': txt})
+        if cfg.clipboard_get_command:
+            self._clip_get = ClipGetCmd(cfg.clipboard_get_command)
+        else:
+            if cfg.save_history:
+                write_dir = SCLI_ATTACHMENT_DIR
+                Path(write_dir).mkdir(parents=True, exist_ok=True)
+            else:
+                write_dir = tempfile.mkdtemp(prefix="scli_")
+                atexit.register(
+                        shutil.rmtree,
+                        write_dir,
+                        )
+            if shutil.which("wl-paste"):
+                self._clip_get = ClipGetTargets(
+                        get_target_cmd="wl-paste -t",
+                        get_targets_list_cmd="wl-paste -l",
+                        write_dir=write_dir,
+                        )
+            elif shutil.which("xclip"):
+                self._clip_get = ClipGetTargets(
+                        get_target_cmd="xclip -o -sel c -t",
+                        get_targets_list_cmd="xclip -o -sel c -t TARGETS",
+                        write_dir=write_dir,
+                        )
+            else:
+                self._clip_get = ClipGetBlank()
+                logger.warning("No clipboard paste command found; disabling querying clipboard for files.")
 
-    @staticmethod
-    def files():
-        cmd = cfg.clipboard_get_command
-        if cmd is None:
-            return clip.xfiles()
-        return callf(cmd, capture_output=True).stdout.split('\n')
+    def files_list(self):
+        return self._clip_get.files_list()
+
+    def put(self, text):
+        return self._clip_put.put(text)
 
 
 # #############################################################################
@@ -456,62 +576,15 @@ class clip:
 # #############################################################################
 
 
-class CallbackQueue:
-    def __init__(self):
-        # The _queue is a list with each item a tuple: ({proc1, proc2, ..}, callback, callback_kwargs, proc_callback, proc_callback_kwargs)
-        self._queue = []
-        self._accepting_new_procs_for_item = False
-
-    def new_item(self, callback, callback_kwargs, proc_callback, proc_callback_kwargs):
-        if callback is None and proc_callback is None:
-            return
-        self._queue.append(
-                (set(), callback, callback_kwargs, proc_callback, proc_callback_kwargs)
-                )
-        self._accepting_new_procs_for_item = True
-
-    def add_proc(self, proc):
-        if not self._accepting_new_procs_for_item:
-            return
-        curr_item = self._queue[-1]
-        procs = curr_item[0]
-        procs.add(proc)
-
-    def finalize_item(self):
-        self._accepting_new_procs_for_item = False
-        if self._queue and not self._queue[-1][0]:
-            # All background procs have already finished, or there had been none started
-            self._pop_callback(-1)
-
-    def on_proc_done(self, proc):
-        for ind, item in enumerate(self._queue):
-            procs, *_ = item
-            if proc not in procs:
-                continue
-            self._run_proc_callback(ind, proc)
-            procs.remove(proc)
-            if not procs and not self._accepting_new_procs_for_item:
-                self._pop_callback(ind)
-            return
-
-    def _run_proc_callback(self, queue_index, proc):
-        *_, proc_callback, proc_callback_kwargs = self._queue[queue_index]
-        if proc_callback is not None:
-            proc_callback(proc, **proc_callback_kwargs)
-
-    def _pop_callback(self, queue_index):
-        _, callback, callback_kwargs, *_ = self._queue.pop(queue_index)
-        if callback is not None:
-            callback(**callback_kwargs)
-
-
 class AsyncProc:
     def __init__(self, main_loop):
         # The `main_loop` is an object like `urwid.MainLoop`, that implements `watch_pipe()` and `set_alarm_in()` methods.
         self.main_loop = main_loop
-        self._callback_queue = CallbackQueue()
 
-    def run(self, args, callback=None, *callback_args, shell=False, **callback_kwargs):
+    def _on_proc_started(self, proc): pass
+    def _on_proc_done(self, proc): pass
+
+    def run(self, args, shell, callback, callback_args, callback_kwargs):
         """ Run the command composed of `args` in the background (asynchronously); run the `callback` function when it finishes """
 
         def watchpipe_handler(line):
@@ -522,9 +595,10 @@ class AsyncProc:
 
             proc.returncode = return_code   # overwrite the 'wrapper' command return code (always 0) with the actual command return code
             proc.output = proc.stderr.read().rstrip('\n')   # stderr stream is not seekable, so can be read only once
+            proc.stderr.close()
 
             if return_code != 0:
-                logging.error(
+                logger.error(
                         'proc: cmd:`%s`; return_code:%d; output:"%s"',
                         proc.args,
                         return_code,
@@ -533,7 +607,7 @@ class AsyncProc:
 
             if callback is not None:
                 callback(proc, *callback_args, **callback_kwargs)
-            self._callback_queue.on_proc_done(proc)
+            self._on_proc_done(proc)
 
             os.close(watchpipe_fd)  # Close the write end of watch pipe.
             return False    # Close the read end of watch pipe and remove the watch from event_loop.
@@ -555,10 +629,136 @@ class AsyncProc:
                 universal_newlines=True,
                 )
         atexit.register(proc.kill)   # prevent orphaned processes surviving after the main program is stopped
-        self._callback_queue.add_proc(proc)
+        self._on_proc_started(proc)
         return proc
 
-    @contextlib.contextmanager
+
+class AsyncQueued(AsyncProc):
+
+    _MAX_BACKGROUND_PROCS_DEFAULT = 64
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._curr_running = set()
+        self._run_queue = collections.deque()
+        try:
+            self._max_background_procs = self._background_procs_resource(self._MAX_BACKGROUND_PROCS_DEFAULT)
+        except OSError:
+            self._max_background_procs = self._MAX_BACKGROUND_PROCS_DEFAULT
+
+    @staticmethod
+    def _background_procs_resource(default):
+        nprocs = min(
+                default,
+                resource.getrlimit(resource.RLIMIT_NPROC)[0],
+                )
+        try:
+            n_curr_fds = len(os.listdir('/proc/self/fd')) * 3 # x3 to account for signal-cli's added FDs after it starts
+        except OSError:
+            n_curr_fds = 32
+        fd_limits = [nprocs*3+n_curr_fds]  # each proc opens 3 FDs
+        for res_name in ("RLIMIT_NOFILE", "RLIMIT_OFILE"):
+            with suppress(AttributeError, OSError, ValueError):
+                res = getattr(resource, res_name)
+                fd_limits.append(resource.getrlimit(res)[0])
+        return (min(fd_limits) - n_curr_fds) // 3
+
+    @property
+    def _max_procs_reached(self):
+        return len(self._curr_running) == self._max_background_procs
+
+    def _add_run_to_queue(self, run_args):
+        self._run_queue.append(run_args)
+
+    def run(self, args, callback=None, *callback_args, shell=False, **callback_kwargs):
+        run_args = {k: v for k, v in locals().items() if k not in ('self', '__class__')}
+        if not self._max_procs_reached:
+            return super().run(**run_args)
+        else:
+            return self._add_run_to_queue(run_args)
+
+    def _on_proc_started(self, proc):
+        super()._on_proc_started(proc)
+        self._curr_running.add(proc)
+
+    def _pop_run(self, proc):
+        self._curr_running.remove(proc)
+        try:
+            return self._run_queue.popleft()
+        except IndexError:
+            return None
+
+    def _on_proc_done(self, proc):
+        super()._on_proc_done(proc)
+        run_args_next = self._pop_run(proc)
+        if run_args_next is not None:
+            started_proc = super().run(**run_args_next)
+        else:
+            started_proc = None
+        return (run_args_next, started_proc)
+
+
+class AsyncContext(AsyncQueued):
+
+    class ContextItem:
+        __slots__ = (
+                'procs',
+                'callback',
+                'callback_kwargs',
+                'proc_callback',
+                'proc_callback_kwargs',
+                'buffered_runs',
+                )
+
+        def __init__(self, callback, callback_kwargs, proc_callback, proc_callback_kwargs):
+            self.procs = set()
+            self.callback = callback
+            self.callback_kwargs = callback_kwargs
+            self.proc_callback = proc_callback
+            self.proc_callback_kwargs = proc_callback_kwargs
+            self.buffered_runs = set()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._context_items = collections.deque()
+        self._accepting_new_procs_for_item = False
+
+    def _new_item(self, callback, callback_kwargs, proc_callback, proc_callback_kwargs):
+        if callback is None and proc_callback is None:
+            return
+        self._context_items.append(
+                self.ContextItem(callback, callback_kwargs, proc_callback, proc_callback_kwargs)
+                )
+        self._accepting_new_procs_for_item = True
+
+    @property
+    def _curr_item(self):
+        return self._context_items[-1]
+
+    def _on_proc_started(self, proc):
+        super()._on_proc_started(proc)
+        if not self._accepting_new_procs_for_item:
+            return
+        self._curr_item.procs.add(proc)
+
+    def _finalize_item(self):
+        self._accepting_new_procs_for_item = False
+        if not self._context_items:
+            return
+        curr_item = self._curr_item
+        if not (curr_item.procs or curr_item.buffered_runs):
+            # No background procs have been started
+            self._pop_callback()
+
+    def _pop_callback(self, item=None):
+        if item is None:
+            item = self._context_items.pop()
+        else:
+            self._context_items.remove(item)
+        if item.callback is not None:
+            item.callback(**item.callback_kwargs)
+
+    @contextmanager
     def callback_finally(
             self,
             callback=None,
@@ -573,21 +773,65 @@ class AsyncProc:
 
         proc_callback_kwargs = proc_callback_kwargs or {}
         try:
-            yield self._callback_queue.new_item(
+            yield self._new_item(
                     callback,
                     callback_kwargs,
                     proc_callback,
                     proc_callback_kwargs,
                     )
         finally:
-            self._callback_queue.finalize_item()
+            self._finalize_item()
+
+    @staticmethod
+    def _run_id(run_params):
+        return id(run_params)
+
+    def _add_buffered_run(self, run_params):
+        if not self._accepting_new_procs_for_item:
+            return
+        self._curr_item.buffered_runs.add(self._run_id(run_params))
+
+    def _add_run_to_queue(self, run_args):
+        super()._add_run_to_queue(run_args)
+        self._add_buffered_run(run_args)
+
+    def _remove_buffered_run(self, run_params, started_proc):
+        if run_params is None:
+            return
+        run_id = self._run_id(run_params)
+        for item in self._context_items:
+            try:
+                item.buffered_runs.remove(run_id)
+            except KeyError:
+                continue
+            else:
+                item.procs.add(started_proc)
+                    # There should be no race condition if the proc has already finished: the python code is executed in a single thread, and this is always run before the proc's return is processed.
+                return
+
+    def _on_proc_done(self, proc):
+        self._remove_buffered_run(*super()._on_proc_done(proc))
+        for item in self._context_items:
+            try:
+                item.procs.remove(proc)
+            except KeyError:
+                continue
+            if item.proc_callback is not None:
+                item.proc_callback(proc, **item.proc_callback_kwargs)
+            if not (item.procs or item.buffered_runs or self._accepting_new_procs_for_item):
+                self._pop_callback(item)
+            return
 
 
-class Daemon(AsyncProc):
+class Daemon(AsyncContext):
     def __init__(self, main_loop, username):
         super().__init__(main_loop)
         self._username = username
-        self._buffer = b''
+        self._buffer = ''
+        self.logger = logging.getLogger(f"{self.__class__.__name__}")
+        self._logger_level_re = re.compile(r"^(2.*? \[.*\] )?(?P<lev_name>[A-Z]+) .*$")
+        self._msg_processing_paused = True
+            # Paused initially, to prevent a race condition betw registering the dbus service and getting a message on stdout (e.g. while polling in _run_when_dbus_service_started)
         self.callbacks = {
                 cb_name: noop for cb_name in [
                     'daemon_started',
@@ -607,6 +851,7 @@ class Daemon(AsyncProc):
                     'remote_delete',
                     'sending_remote_delete_done',
                     'untrusted_identity_err',
+                    'user_unregistered_err',
                 ]
             }
 
@@ -614,12 +859,13 @@ class Daemon(AsyncProc):
         stdout_fd = self.main_loop.watch_pipe(self._daemon_stdout_handler)
         stderr_fd = self.main_loop.watch_pipe(self._daemon_stderr_handler)
         try:
-            proc = callf(
+            proc = proc_run(
                     cfg.daemon_command,
                     {'%u': self._username, '_optionals': ['%u']},
                     background=True,
                     stdout=stdout_fd,
                     stderr=stderr_fd,
+                    #text=True,  # urwid returns bytes-objects anyway; see comment in _daemon_stdout_handler
                     )
         except FileNotFoundError:
             sys.exit(
@@ -628,46 +874,65 @@ class Daemon(AsyncProc):
                     )
         return proc
 
-    def _daemon_stdout_handler(self, bytes_recv):
-        bytes_recv = self._buffer + bytes_recv
-        lines = bytes_recv.split(b'\n')
-        if lines[-1] != b'':
-            # Not a complete message. Store in buffer
-            self._buffer = lines[-1]
-        else:
-            self._buffer = b''
+    def _daemon_stdout_handler(self, output):
+        output = self._buffer + output.decode()
+            # The `output` (supplied by urwid) is a `bytes` object, even when the `subprocess` is launched with `text=True`.
+        if self._msg_processing_paused:
+            self._buffer = output
+            return True
+        lines = output.split('\n')  # Different from splitlines(): adds a final '' element after '\n'
+        self._buffer = lines.pop()
 
-        # The last item is either empty or an incomplete message, so we don't process it
-        for line in lines[:-1]:
-            if not line.strip():
+        for line in lines:
+            if not line or line.isspace():
                 continue
             try:
-                json_data = json.loads(line.decode('utf-8'))
+                json_data = json.loads(line)
                 envelope = json_data['envelope']
             except (json.JSONDecodeError, KeyError) as err:
-                logging.error('Could not parse daemon output: %s', line)
-                logging.exception(err)
-            else:
-                logging.debug("Daemon: json_data = \n%s", pprint.pformat(json_data))
-                error_data = json_data.get('error')
-                if error_data is not None:
-                    self._error_data_handler(error_data, envelope)
-                else:
-                    self._envelope_handler(envelope)
+                logger.error('Could not parse daemon output: %s', line)
+                logger.exception(err)
+                return True
+            logger.debug("Daemon: json_data = \n%s", pprint.pformat(json_data))
+            error_data = None
+            for error_key in ('error', 'exception'):
+                try:
+                    error_data = json_data[error_key]
+                except KeyError:
+                    continue
+                self._error_data_handler(error_data, envelope)
+            if error_data is None:
+                self._envelope_handler(envelope)
+        return True
 
-    def _daemon_stderr_handler(self, bytes_recv):
-        line = bytes_recv.decode().strip()
-        if not line:
-            return
-        logging.info('daemon_log: %s', line)
-        self.callbacks['daemon_log'](line)
-        if any(s in line for s in (
-                "Exported dbus object: /org/asamk/Signal",  # signal-cli v0.9.2 or earlier
-                "DBus daemon running",
+    def _daemon_stderr_handler(self, output):
+        lines = output.decode().strip()
+        if not lines:
+            return True
+        if self._msg_processing_paused:
+            # Using it as a proxy for "signal-cli dbus service not yet running".
+            if any(s in lines for s in (
+                #"Exported dbus object: /org/asamk/Signal",  # signal-cli v0.9.2 or earlier
+                "DBus daemon running",  # signal-cli v0.12.8 or earlier
+                "Started DBus server",
                 )):
-            self._run_when_dbus_service_started(
-                    self.callbacks['daemon_started']
+                self._run_when_dbus_service_started(
+                        self.callbacks['daemon_started']
+                        )
+            elif "in use by another instance" in lines:
+                self.callbacks['daemon_log']('another_instance_running', lines)
+            elif "Config file lock acquired" in lines:
+                self.callbacks['daemon_log']('another_instance_stopped', lines)
+        for line in lines.splitlines():
+            log_lev = getattr(
+                    logging,
+                    self._daemon_output_log_level(line) or "INFO",
+                    logging.INFO,
                     )
+            self.logger.log(log_lev, line)
+            if line.startswith("ERROR") and not self.is_dbus_service_running:
+                self.callbacks['daemon_log']('daemon_stopped', line)
+        return True
 
     def _envelope_handler(self, envelope):
         envelope['_received_timestamp'] = get_current_timestamp_ms()
@@ -696,19 +961,30 @@ class Daemon(AsyncProc):
         elif get_envelope_sticker(envelope):
             self.callbacks['receive_sticker'](envelope)
         else:
-            logging.info('No action for received envelope: %s', pprint.pformat(envelope))
+            logger.info('No action for received envelope: %s', pprint.pformat(envelope))
 
     def _error_data_handler(self, error_data, envelope):
-        logging.error("Daemon: error = \n%s", pprint.pformat(error_data))
+        logger.error("Daemon: error = \n%s", pprint.pformat(error_data))
         if error_data.get('type') == 'UntrustedIdentityException':
             self.callbacks['untrusted_identity_err'](envelope)
+
+    def _daemon_output_log_level(self, line):
+        match = self._logger_level_re.match(line)
+        return match.group("lev_name") if match else None
+
+    def pause_message_processing(self):
+        self._msg_processing_paused = True
+
+    def unpause_message_processing(self):
+        self._msg_processing_paused = False
+        self._daemon_stdout_handler(b'')
 
     def _dbus_send(self, args, *proc_args, async_proc=True, **proc_kwargs):
         args = [
                 'dbus-send',
                 '--session',
                 '--type=method_call',
-                '--print-reply',
+                '--print-reply=literal',
                 *args
                 ]
         if async_proc:
@@ -772,15 +1048,16 @@ class Daemon(AsyncProc):
             if any(s in proc.output for s in (
                     "UntrustedIdentity",
                     "Untrusted Identity",
-                    "Unregistered user",
                     )):
+                self.callbacks['untrusted_identity_err'](envelope)
+            elif "Unregistered user" in proc.output:
                 # Related signal-cli issues: #348, #828.
                 if not is_envelope_group_message(envelope):
-                    self.callbacks['untrusted_identity_err'](envelope)
+                    self.callbacks['user_unregistered_err'](envelope)
                 else:
                     # Ad-hoc parsing of signal-cli's stderr output.
                     timestamp_adj = int(proc.output.splitlines()[0].rsplit(': ', 1)[-1])
-                    logging.warning("some group members have uninstalled signal: %s", proc.output)
+                    logger.warning("some group members have uninstalled signal: %s", proc.output)
                     self.callbacks[callback_name](envelope, 'ignore_receipts', timestamp_adj)
                     return
             self.callbacks[callback_name](envelope, 'send_failed')
@@ -790,8 +1067,8 @@ class Daemon(AsyncProc):
         try:
             timestamp_adj = int(proc.output.rsplit(maxsplit=1)[1])
         except (IndexError, AttributeError) as err:
-            logging.error("send_message: Failed to get adjusted envelope timestamp")
-            logging.exception(err)
+            logger.error("send_message: Failed to get adjusted envelope timestamp")
+            logger.exception(err)
             self.callbacks[callback_name](envelope)
         else:
             self.callbacks[callback_name](envelope, 'sent', timestamp_adj)
@@ -801,9 +1078,8 @@ class Daemon(AsyncProc):
 
         if attachments is None:
             attachments = []
-        attachment_paths = [os.path.expanduser(attachment) for attachment in attachments]
-        if not all(os.path.exists(attachment_path) for attachment_path in attachment_paths):
-            logging.warning('send_message: Attached file(s) does not exist.')
+        if not all(os.path.exists(attch) for attch in attachments):
+            logger.error('send_message: Attached file(s) do not exist: %s', attachments)
             return
 
         timestamp = get_current_timestamp_ms()
@@ -819,25 +1095,18 @@ class Daemon(AsyncProc):
         }
 
         def after_send_proc_returns(proc):
-            # Remove temproary attachments
-            for attachment in envelope['dataMessage']['attachments']:
-                if attachment.startswith(
-                        os.path.join(tempfile.gettempdir(), clip.tempfile_prefix)
-                        ):
-                    os.remove(attachment)
-
             # Check if send command succeeded
             self._parse_send_proc_output(proc, envelope, 'sending_done')
 
         self._send_message_dbus_cmd(
                 message,
-                attachment_paths,
+                attachments,
                 contact_id,
                 is_group,
                 callback=after_send_proc_returns,
                 )
 
-        logging.info('send_message: %s', envelope)
+        logger.info('send_message: %s', envelope)
         self.callbacks['sending_message'](envelope)
 
     def send_reaction(self, contact_id, emoji, orig_author, orig_ts, remove=False):
@@ -876,7 +1145,7 @@ class Daemon(AsyncProc):
                 is_group,
                 callback=after_send_proc_returns
                 )
-        logging.info('send_reaction: %s', envelope)
+        logger.info('send_reaction: %s', envelope)
         self.callbacks['sending_reaction'](envelope)
 
     def send_remote_delete(self, contact_id, orig_ts):
@@ -928,12 +1197,9 @@ class Daemon(AsyncProc):
                     ]
         self._dbus_send_signal_cli(args, *proc_args, **proc_kwargs)
 
-    def get_group_name(self, group_id, callback, *cb_args, **cb_kwargs):
+    def _get_group_name(self, group_id, callback, *cb_args, **cb_kwargs):
         def proc_callback(proc):
-            try:
-                name = proc.output.split('\n')[1][11:-1]   # Ad-hoc parsing of `dbus-send` output
-            except IndexError:
-                name = group_id[:10] + '[..]'
+            name = proc.output.strip() or group_id[:10] + '[..]'
             callback(name, *cb_args, **cb_kwargs)
         args = [
                 "org.asamk.Signal.getGroupName",
@@ -941,13 +1207,10 @@ class Daemon(AsyncProc):
                 ]
         self._dbus_send_signal_cli(args, callback=proc_callback)
 
-    def get_group_members(self, group_id, callback, *cb_args, **cb_kwargs):
+    def _get_group_members(self, group_id, callback, *cb_args, **cb_kwargs):
         def proc_callback(proc):
-            members_ids = set()
-            for line in proc.output.split('\n')[2:-1]:
-                # Ad hoc parsing of `dbus-send` output
-                phone_num = line[14:-1]
-                members_ids.add(phone_num)
+            # Ad hoc parsing of `dbus-send` output
+            members_ids = set(proc.output[10:-1].split())
             callback(members_ids, *cb_args, **cb_kwargs)
         args = [
                 "org.asamk.Signal.getGroupMembers",
@@ -955,9 +1218,81 @@ class Daemon(AsyncProc):
                 ]
         self._dbus_send_signal_cli(args, callback=proc_callback)
 
+    def get_groups_ids(self, callback, *cb_args, **cb_kwargs):
+        def proc_callback(proc):
+            groups_ids = set()
+            bytearray_line_continued = False
+            for line in proc.output.splitlines():
+                # Ad hoc parsing of `dbus-send` output
+                if line.endswith('array of bytes ['):
+                    gid_bytes_array = ''
+                    bytearray_line_continued = True
+                elif bytearray_line_continued:
+                    if line.startswith("         ]"):
+                        bytearray_line_continued = False
+                        groups_ids.add(hex_str_to_b64(gid_bytes_array))
+                    else:
+                        gid_bytes_array += line.strip()
+            callback(groups_ids, *cb_args, **cb_kwargs)
+        args = ["org.asamk.Signal.listGroups"]
+        self._dbus_send_signal_cli(args, callback=proc_callback)
+
+    def populate_groups_dict(self, groups_ids, callback, **cb_kwargs):
+        groups_dict = {}
+        with self.callback_finally(callback, groups_dict=groups_dict, **cb_kwargs):
+            for group_id in groups_ids:
+                group = groups_dict[group_id] = {}
+                group['groupId'] = group_id
+                self._get_group_name(
+                        group_id,
+                        callback=lambda name, group=group: group.update({'name': name})
+                        )
+                self._get_group_members(
+                        group_id,
+                        callback=lambda members_ids, group=group: group.update({'members_ids': members_ids})
+                        )
+
+    def _get_contacts_numbers(self, callback, *cb_args, **cb_kwargs):
+        def proc_callback(proc):
+            try:
+                # Ad-hoc parsing of `dbus-send` output
+                numbers = proc.output.splitlines()[1][:-1].split()
+            except IndexError:
+                numbers = []
+            callback(numbers, *cb_args, **cb_kwargs)
+        args = ["org.asamk.Signal.listNumbers"]
+        self._dbus_send_signal_cli(args, callback=proc_callback)
+
+    def _get_contact_name(self, phone_num, callback, *cb_args, **cb_kwargs):
+        def proc_callback(proc):
+            name = proc.output.strip()
+            callback(phone_num, name, *cb_args, **cb_kwargs)
+        args = [
+                "org.asamk.Signal.getContactName",
+                "string:" + phone_num
+                ]
+        self._dbus_send_signal_cli(args, callback=proc_callback)
+
+    def get_indiv_contacts(self, callback, *cb_args, **cb_kwargs):
+        def on_got_numbers(numbers):
+            with self.callback_finally(
+                    callback=callback,
+                    contacts_dict=contacts_dict,
+                    *cb_args,
+                    **cb_kwargs,
+                    ):
+                for num in numbers:
+                    self._get_contact_name(num, callback=on_got_name)
+        def on_got_name(phone_num, name):
+            contacts_dict[phone_num] = {}
+            contacts_dict[phone_num]["name"] = name
+            contacts_dict[phone_num]["number"] = phone_num
+        contacts_dict = {}
+        self._get_contacts_numbers(callback=on_got_numbers)
+
     def get_signal_cli_version(self, callback, *cb_args, **cb_kwargs):
         def proc_callback(proc):
-            version_num = proc.output.split('\n')[1][11:-1]   # Ad-hoc parsing of `dbus-send` output
+            version_num = proc.output.strip()
             version_string = "signal-cli " + version_num
             callback(version_string, *cb_args, **cb_kwargs)
         args = ["org.asamk.Signal.version"]
@@ -971,7 +1306,7 @@ class Daemon(AsyncProc):
                 'org.freedesktop.DBus.ListNames'
                 ]
         proc = self._dbus_send(args, async_proc=False, capture_output=True, text=True, check=True)
-        signal_cli_str = 'string "org.asamk.Signal"'
+        signal_cli_str = "org.asamk.Signal"
         return signal_cli_str in proc.stdout
 
     def _run_when_dbus_service_started(self, callback):
@@ -992,154 +1327,37 @@ class Daemon(AsyncProc):
 class SignalData:
     def __init__(self, username):
         self._username = username
-        self._file_path = os.path.join(SIGNALCLI_DATA_FOLDER, self._username)
+        self._file_path = self._get_account_file_path()
+        self._data = self._read_data_file()
 
-        if not os.path.exists(self._file_path):
-            self._file_path = os.path.join(SIGNALCLI_LEGACY_DATA_FOLDER, self._username)
-            if not os.path.exists(self._file_path):
-                raise FileNotFoundError(self._username + " does not exist!")
-
-        self._data = None
-
-    def parse_data_file(self):
-        with open(self._file_path, encoding="utf-8") as f:
-            self._data = json.load(f)
-
-        logging.debug("signal-cli account: %s device", "linked" if self.is_linked_device else "master")
-
+    @staticmethod
+    def parse_accounts_json():
+        accounts_json_path = SIGNALCLI_DATA_DIR / "accounts.json"
         try:
-            indivs = self._get_recipients()
+            with open(accounts_json_path, encoding="utf-8") as f:
+                json_data = json.load(f)
         except FileNotFoundError:
-            indivs = self._get_recipients_v1()
+            return []
+        return json_data["accounts"]
 
-        groups = []
-        for g in get_nested(self._data, 'groupStore', 'groups', default=()):
-            if is_group_v2(g):
-                group_id = g['groupId']
-                cached_name = self._get_group_v2_cache_name(group_id)
-                g['name'] = cached_name or group_id[:10] + '[..]'
-            if g.get('archived') or not g.get('name'):
-                continue
-            g['name'] = strip_non_printable_chars(g['name'])
-            groups.append(g)
+    def _get_account_file_path(self):
+        accounts = self.parse_accounts_json()
+        for acc in accounts:
+            if acc["number"] == self._username:
+                return SIGNALCLI_DATA_DIR / acc["path"]
+        raise FileNotFoundError(self._username + " does not exist!")
 
-        return indivs, groups
-
-    def _get_group_v2_cache_name(self, group_id):
-        # This is a crude hack to extract a group name from the group-cache's protobuf binary file without dealing with protobuf or querying signal-cli's `getGroupName`.
-        # See
-        # https://github.com/AsamK/signal-cli/issues/386
-        cache = None
-        for filename in (
-                group_id.replace("/", "_"),
-                b64_to_hex_str(group_id)
-                ):
-            # Since signal-cli v0.7.2, group-cache files' names are `group_id`s with `/` replaced with `_`. Existing group-cache filenames (hex-formatted) from v0.7.{0,1} are kept without renaming, so here we have to try both.
-            path = os.path.join(self._file_path + '.d', 'group-cache', filename)
-            try:
-                with open(path, 'br') as fo:
-                    cache = fo.read()
-            except FileNotFoundError:
-                logging.debug(
-                        "Could not open v2 group cache file\n\t"
-                        "group_id = %s\n\t"
-                        "filepath = %s",
-                        group_id, path
-                        )
-                continue
-            else:
-                break
-        if cache is None:
-            logging.warning(
-                    "Could not open v2 group cache file\n\t"
-                    "group_id = %s",
-                    group_id
-                    )
-            return None
-        cache_part = cache[2:]
-        for name_end_str in (b'"\x00', b'\x1aI'):
-            cache_part = cache_part.partition(name_end_str)[0]
-        if len(cache_part) == len(cache) - 2:
-            return None
-        try:
-            return cache_part.decode()
-        except UnicodeDecodeError:
-            return None
-
-    def _get_recipients(self):
-        recipients_store_file = os.path.join(self._file_path + '.d', 'recipients-store')
-        with open(recipients_store_file, encoding="utf-8") as f:
-            recipients_data = json.load(f)
-
-        ret = []
-        for recip in recipients_data['recipients']:
-            # Skip contact if the number is `null`
-            if not recip['number']:
-                continue
-
-            # Flatten contact's data dictionary to match signal-cli data file v1 structure
-            try:
-                for key, val in recip['contact'].items():
-                    recip[key] = val
-            except (KeyError, AttributeError):
-                pass
-
-            # Strip bidi chars (see #115)
-            try:
-                recip['name'] = strip_non_printable_chars(recip['name'])
-            except (KeyError, AttributeError):
-                pass
-
-            # Add profile name
-            profile_name = ''
-            for n in ('givenName', 'familyName'):
-                name_part = get_nested(recip, 'profile', n)
-                if name_part:
-                    profile_name += name_part
-            recip['profile_name'] = profile_name or None
-
-            ret.append(recip)
-        return ret
-
-    def _get_recipients_v1(self):
-        profile_names = self._get_profile_names_v1()
-
-        indivs = []
-        for cont in self._data['contactStore']['contacts']:
-            if not cont['number']:
-                continue
-            cont['profile_name'] = profile_names.get(get_contact_id(cont))
-                # snake_case in key name, so it should never clash with signal-cli's own key names, in camelCase.
-            try:
-                cont['name'] = strip_non_printable_chars(cont['name'])
-            except (KeyError, AttributeError):
-                pass
-            indivs.append(cont)
-
-        return indivs
-
-    def _get_profile_names_v1(self):
-        profile_names = {}
-        try:
-            profiles = self._data['profileStore']['profiles']
-        except KeyError:
-            return profile_names
-        for prof in profiles:
-            try:
-                num = prof['name']
-                profile_name = prof['profile']['name']
-            except (KeyError, TypeError):
-                continue
-            profile_names[num] = profile_name
-        return profile_names
+    def _read_data_file(self):
+        with open(self._file_path, encoding="utf-8") as f:
+            return json.load(f)
 
     @property
     def own_num(self):
-        return self._data['username']
+        return self._username
 
     @property
     def is_linked_device(self):
-        # Assuming master device must always get `deviceId == 1`
+        # The primary device should have a `deviceId == 1`
         return self._data['deviceId'] != 1
 
 
@@ -1152,7 +1370,7 @@ class Contact:
         self._record = record
         self.avatar = self._get_avatar_file_path()
         if self.is_group:
-            self.members_ids = set()
+            self.members_ids = record.get('members_ids') or set()
             self.member_contacts = set()
 
     def __getattr__(self, attr):
@@ -1165,11 +1383,8 @@ class Contact:
     def _get_avatar_file_path(self):
         # Might be implemented in the future by signal-cli: https://github.com/AsamK/signal-cli/issues/869
         def get_path(file_prefix, contact_id):
-            path = os.path.join(
-                    SIGNALCLI_AVATARS_FOLDER,
-                    f'{file_prefix}-{contact_id}',
-                    )
-            return path if os.path.exists(path) else None
+            path = SIGNALCLI_AVATARS_DIR / f'{file_prefix}-{contact_id}'
+            return str(path) if path.exists() else None
         if self.is_group:
             return get_path('group', self.id.replace("/", "_"))
         for file_prefix in ('profile', 'contact'):
@@ -1192,25 +1407,43 @@ class Contact:
 
     @property
     def name_or_id(self):
-        return self.name or self.profile_name or self.id
+        return self.name or self.id
+
+    def serialize(self):
+        return self._record
 
 
 class Contacts:
-    def __init__(self, sigdata):
+    def __init__(self, sigdata, contacts_cache=None):
         self.sigdata = sigdata
-        self.reload()
+        self.indivs = set()
+        self.groups = set()
+        self.map = {}
+        self.update(contacts_cache, clear=True)
 
-    def reload(self):
-        indivs_dicts, groups_dicts = self.sigdata.parse_data_file()
-        self.indivs = set(Contact(c) for c in indivs_dicts)
-        self.groups = set(Contact(g) for g in groups_dicts)
-        self.map = {c.id: c for c in self.indivs | self.groups}
+    def _clear(self):
+        self.indivs = set()
+        self.groups = set()
+        self.map = {}
+
+    def update(self, contacts_dict=None, clear=False):
+        if clear:
+            self._clear()
+        if not contacts_dict:
+            return
+        for cid, contact_dict in contacts_dict.items():
+            contact = Contact(contact_dict)
+            self.map[cid] = contact
+            if is_contact_group(contact_dict):
+                self.groups.add(contact)
+            else:
+                self.indivs.add(contact)
 
     def set_groups_membership(self):
         for group in self.groups:
             group.members_ids.discard(self.sigdata.own_num)
             group.member_contacts = self._get_group_members(group)
-                # Naming: group.members == group._record['members'] (from signal-cli data)
+                # Naming: was (historically), group.members == group._record['members'] (from signal-cli data)
 
     def _get_group_members(self, group):
         members = set()
@@ -1225,6 +1458,8 @@ class Contacts:
     def get_by_id(self, contact_id):
         return self.map.get(contact_id)
 
+    def serialize(self):
+        return {c.id: c.serialize() for c in self.map.values()}
 
 # #############################################################################
 # chats data
@@ -1398,12 +1633,10 @@ class ReorderedTimestamps(list):
             edge = False
         modified = False
         for ioffset in range(1) if edge else range(-1, 1):
-            try:
+            with suppress(IndexError, KeyError):
                 neighb = self[index+ioffset]
                 del self._reordered_timestamps[(neighb.sender_num, neighb.timestamp)]
                 modified = True
-            except (IndexError, KeyError):
-                pass
         if modified:
             self._add_reordered_neighbors(index)
 
@@ -1505,8 +1738,8 @@ class Chat(ReorderedTimestamps, urwid.MonitoredList):
                 index = self.index(msg)
             del self[index]
         except (ValueError, IndexError) as err:
-            logging.info("Chat.delete(): message not found; envelope = %s", msg.envelope)
-            logging.exception(err)
+            logger.warning("Chat.delete(): message not found; envelope = %s", msg.envelope)
+            logger.exception(err)
             raise ValueError from err
         self._delete_from_reordered(msg, index)
 
@@ -1518,7 +1751,7 @@ class Chat(ReorderedTimestamps, urwid.MonitoredList):
             # This should rarely be necessary, as signal-cli's timestamp adjustments are small enough (~50ms) to not modify the messages' order.
         index = index or self.index(msg)
         if not self._is_neighbd_monotonic(index):
-            logging.debug("Chat: moving msg to maintain sorted history: %s", timestamp_adj)
+            logger.debug("Chat: moving msg to maintain sorted history: %s", timestamp_adj)
             self.delete(msg, index)
             self.add(msg)
 
@@ -1539,8 +1772,8 @@ class Chats:
             index = chat.get_index_for_envelope(envelope)
             return chat, index
         except (KeyError, ValueError, IndexError) as err:
-            logging.error("get_msg_for_envelope(): envelope = %s", envelope)
-            logging.exception(err)
+            logger.error("get_msg_for_envelope(): envelope = %s", envelope)
+            logger.exception(err)
             raise ValueError from err
 
     def get_msg_for_envelope(self, envelope):
@@ -1566,7 +1799,7 @@ class Chats:
                     sender_num=reaction['targetAuthor']
                     )
         except ValueError:
-            logging.error("Message not found for reaction: %s", pprint.pformat(envelope))
+            logger.error("Message not found for reaction: %s", pprint.pformat(envelope))
             return None
         msg.add_reaction(envelope)
         return msg
@@ -1579,7 +1812,7 @@ class Chats:
                     sender_num=get_envelope_sender_id(envelope)
                     )
         except ValueError:
-            logging.error("Message not found for remote delete envelope: %s", envelope)
+            logger.error("Message not found for remote delete envelope: %s", envelope)
             return None
         msg.remote_delete = envelope
         return msg
@@ -1593,18 +1826,18 @@ class Chats:
         for chat in self._dict.values():
             for msg in chat:
                 envelope = msg.envelope
-                if 'typingMessage' in envelope:
+                if (
+                        "typingMessage" in envelope
+                        or
+                        envelope.get("_artificialEnvelope") == "untrustedIdentity"
+                        ):
                     continue
                 envelopes.append(envelope)
-                try:
+                with suppress(AttributeError):
                     envelopes.extend(msg.reactions.values())
-                except AttributeError:
-                    pass
-                try:
+                with suppress(AttributeError):
                     # Currently, the "deleted" messages are saved in the history file.
                     envelopes.append(msg.remote_delete)
-                except AttributeError:
-                    pass
         return envelopes
 
 
@@ -1698,7 +1931,7 @@ class DeliveryStatus:
                 'read':             '✓✓',
                 'ignore_receipts':  '✓',
                 }
-        max_len = max([len(text) for text in status_text.values()])
+        max_len = max((len(text) for text in status_text.values()))
         markup_map = {}
         for status, text in status_text.items():
             markup_map[status] = (
@@ -1732,8 +1965,10 @@ class DeliveryStatus:
             status = 'delivered'
         elif receipt_message['isRead']:
             status = 'read'
+        elif receipt_message['isViewed']:
+            return
         else:
-            logging.error('on_receive_receipt: unknown receipt type in envelope %s', envelope)
+            logger.error('on_receive_receipt: unknown receipt type in envelope %s', envelope)
             return
         timestamps = receipt_message['timestamps']
         when = receipt_message['when']
@@ -1753,7 +1988,7 @@ class DeliveryStatus:
     def on_sending_done(self, envelope, status='sent', timestamp_adj=None):
         timestamp = get_envelope_time(envelope)
         if timestamp not in self._status_map:
-            logging.error("DeliveryStatus: on_sending_done(): no corresponding timestamp in _status_map for envelope = %s", envelope)
+            logger.error("DeliveryStatus: on_sending_done(): no corresponding timestamp in _status_map for envelope = %s", envelope)
             return
         self._set(timestamp, status)
         if status == 'send_failed':
@@ -1779,7 +2014,7 @@ class DeliveryStatus:
             if status is None:
                 return
 
-        logging.info("Setting status = `%s` for timestamp = %s", status, timestamp)
+        logger.info("Setting status = `%s` for timestamp = %s", status, timestamp)
         curr_status_detailed.str = status
         if when is not None:
             curr_status_detailed.when = when
@@ -1795,7 +2030,7 @@ class DeliveryStatus:
         status_detailed.grp_memb_remain_un = self.DelivReadConts(set(group_members), set())
 
     def _buffer_receipt(self, timestamp, status, contact):
-        logging.debug("DeliveryStatus: buffering timestamp = %s", timestamp)
+        logger.debug("DeliveryStatus: buffering timestamp = %s", timestamp)
         buffered = self._buffered.setdefault(
                 timestamp,
                 self.DelivReadConts(
@@ -1809,7 +2044,7 @@ class DeliveryStatus:
         buffered = self._buffered.get(timestamp)
         if buffered is None:
             return
-        logging.debug("Processing buffered receipts: timestamp = %s, self._buffered = %s", timestamp, self._buffered)
+        logger.debug("Processing buffered receipts: timestamp = %s, self._buffered = %s", timestamp, self._buffered)
         for status in buffered._fields:
             buffered_contacts = getattr(buffered, status) or []
             for contact in buffered_contacts:
@@ -1817,10 +2052,8 @@ class DeliveryStatus:
         del self._buffered[timestamp]
 
     def delete(self, timestamp):
-        try:
+        with suppress(KeyError):
             del self._status_map[timestamp]
-        except KeyError:
-            pass
 
     def dump(self):
         ret = {}
@@ -1840,9 +2073,6 @@ class TypingIndicators:
         self._chats = chats
         self._map = {}
         self.set_alarm_in = self.remove_alarm = noop
-            # In some cases the STOPPED typing message is never sent, e.g. when the last key is `backspace`.
-            #   https://github.com/AsamK/signal-cli/issues/458
-            # So we need to manually set a timeout / alarm to remove the typing indicator in this case.
 
     def on_typing_message(self, envelope):
         sender_num = get_envelope_sender_id(envelope)
@@ -1851,7 +2081,7 @@ class TypingIndicators:
         if typing_event == 'STARTED':
             self._add(sender_num, envelope)
         elif typing_event != 'STOPPED':
-            logging.error("on_typing_message: unknown `action` type in %s", envelope)
+            logger.warning("on_typing_message: unknown `action` type in %s", envelope)
 
     def _add(self, sender_num, envelope):
         msg = self._chats.add_envelope(envelope)
@@ -1867,7 +2097,7 @@ class TypingIndicators:
         try:
             self._chats.delete_message(msg)
         except ValueError:
-            logging.info("TypingIndicators: remove: index not found for envelope = %s", msg.envelope)
+            logger.warning("TypingIndicators: remove: index not found for envelope = %s", msg.envelope)
 
 
 class ChatsData:
@@ -1878,6 +2108,7 @@ class ChatsData:
         self.typing_indicators = TypingIndicators(self.chats)
         self._history = history_file
         self.current_contact = None
+        self.contacts_cache = None
 
         if self._history:
             self._load_history()
@@ -1894,9 +2125,11 @@ class ChatsData:
         unread_counts = self.unread_counts.serialize()
         delivery_status = self.delivery_status.dump()
         items = {
+                'version': 5,
                 'envelopes': envelopes,
                 'unread_counts': unread_counts,
                 'delivery_status': delivery_status,
+                'contacts_cache': self.contacts_cache,
                 }
 
         class JSONSetEncoder(json.JSONEncoder):
@@ -1909,6 +2142,7 @@ class ChatsData:
                         return tuple(o)
                     raise
 
+        Path(self._history).parent.mkdir(parents=True, exist_ok=True)
         with open(self._history, 'w', encoding="utf-8") as history_fileobj:
             json.dump(items, history_fileobj, ensure_ascii=False, cls=JSONSetEncoder, indent=2)
 
@@ -1920,12 +2154,13 @@ class ChatsData:
                     history = json.load(history_fileobj)
             except (FileNotFoundError, json.JSONDecodeError) as err:
                 if isinstance(err, json.JSONDecodeError):
-                    logging.error("History file corrupted, attempting to read from backup.")
+                    logger.error("History file corrupted, attempting to read from backup.")
                 continue
             else:
                 break
         else:
-            logging.warning("Could not read history from file.")
+            # This happens on e.g. the first run, before the history file exists.
+            logger.warning("Could not read history from file: %s", self._history)
             return
         os.replace(history_filename, history_backup_filename)
             # If both `history` and `history.bak` are missing, the line above (amounting to `mv history.bak history.bak`) does not throw an error.
@@ -1941,6 +2176,7 @@ class ChatsData:
                 self.chats.add_envelope(envelope)
 
         self.unread_counts = UnreadCounts(history.get('unread_counts', {}))
+        self.contacts_cache = history.get('contacts_cache', {})
 
 
 # #############################################################################
@@ -1961,7 +2197,6 @@ REVERSED_FOCUS_MAP = {
 
 
 def _fill_palette():
-    global PALETTE, REVERSED_FOCUS_MAP   # pylint: disable=global-statement
     palette_reversed = []
     for item in PALETTE:
         name, fg = item[0:2]
@@ -2065,10 +2300,8 @@ class Color:
             return self._exit()   # `return` just to make pylint happy
 
     def for_message(self, msg):
-        try:
+        with suppress(TypeError, KeyError):
             return self._colors[msg.sender_num]
-        except (TypeError, KeyError):
-            pass
         if isinstance(self._colors, list):
             if is_envelope_outgoing(msg.envelope):
                 return 'sent_color'
@@ -2086,6 +2319,9 @@ class Color:
 # #############################################################################
 # ui utility
 # #############################################################################
+
+
+HORIZ_LINE_DIV_SYM = '—' # em dash
 
 
 def markup_to_text(markup):
@@ -2129,16 +2365,68 @@ def listbox_set_body(listbox, body_new):
     urwid.connect_signal(listbox.body, "modified", listbox._invalidate)
 
 
+class LineBoxRoundCorners(urwid.LineBox):
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+                *args,
+                **kwargs,
+                tlcorner=BOX_SYMBOLS.LIGHT.TOP_LEFT_ROUNDED,
+                trcorner=BOX_SYMBOLS.LIGHT.TOP_RIGHT_ROUNDED,
+                blcorner=BOX_SYMBOLS.LIGHT.BOTTOM_LEFT_ROUNDED,
+                brcorner=BOX_SYMBOLS.LIGHT.BOTTOM_RIGHT_ROUNDED,
+                )
+
+
+class LineBoxWBottomEl(urwid.LineBox):
+
+    def __init__(self, *args, bottom_el=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._bottom_el = bottom_el
+        if bottom_el is not None:
+            self.add_bottom_element(bottom_el)
+
+    def add_bottom_element(self, el):
+        bl = self._w.contents[-1][0].contents  # Get bottom line widgets (Columns' contents)
+        bl.insert(1, bl[1]) # Duplicate Divider element
+        bl.insert(2, (      # Instert `el` in the middle
+            el,
+            urwid.Columns.options(width_type='pack'),
+            ))
+        if el.selectable():
+            self._w.focus_position = 2  # Focus linebox's bottom line
+            self._w.focus.focus_position = 2 # Focus bottom_el (the middle element)
+
+    def keypress(self, size, key):
+        key = super().keypress(size, key)
+        if (
+            self._bottom_el is not None
+            and
+            self._bottom_el.selectable()
+            and
+            key in KEY_BINDINGS['focus_next_area'] | KEY_BINDINGS['focus_prev_area']
+        ):
+            self._w.focus_position = (
+                    self._w.focus_position - 1
+                    ) or 2      # Cycle between body and footer elements
+            return None
+        return key
+
+
+class LineBoxCombined(LineBoxRoundCorners, LineBoxWBottomEl):
+    pass
+
+
 class LineBoxHighlight(urwid.WidgetWrap):
-    def __init__(self, w, title=''):
+    def __init__(self, w, title='', **kwargs):
         box_w = urwid.AttrMap(
-                    urwid.LineBox(
-                        urwid.AttrMap(w, ''),  # need to set a "default" attribute, to not color all the contents in `w`
-                        title_align='center',
-                        title=title
-                        ),
-                    None,
-                    focus_map='line_focused',
+                LineBoxCombined(
+                    urwid.AttrMap(w, ''),  # need to set a "default" attribute, to not color all the contents in `w`
+                    title_align='center',
+                    title=title,
+                    **kwargs
+                    ),
+                None,
+                focus_map='line_focused',
                 )
         super().__init__(box_w)
 
@@ -2147,21 +2435,18 @@ class PopUpBox(urwid.WidgetWrap):
 
     signals = ['closed']
 
-    def __init__(self, widget, title='', buttons=True, shadow_len=2):
+    def __init__(self, widget, title='', buttons=True, shadow_len=0):
         self._buttons = buttons
-        try:
+        with suppress(NameError):
             urwid.connect_signal(widget, 'closed', self._emit, user_args=['closed'])
-        except NameError:
-            pass
 
         if buttons:
             def handle_click(_button):
                 self._emit('closed')
-            btn_close = urwid.Padding(urwid.Button('Close', on_press=handle_click), align='center', width=9)
-            self._frame_w = urwid.Frame(widget, footer=btn_close, focus_part='footer')
-            box_w = urwid.LineBox(self._frame_w, title)
+            btn_close = ButtonBox('Close', on_press=handle_click)
+            box_w = LineBoxHighlight(widget, title, bottom_el=btn_close)
         else:
-            box_w = urwid.LineBox(widget)
+            box_w = LineBoxHighlight(widget, title)
 
         if shadow_len:
             ### Shadow effect. (Based on urwid/examples/dialog.py)
@@ -2176,26 +2461,23 @@ class PopUpBox(urwid.WidgetWrap):
                     ])
             box_w = urwid.Frame(
                     box_w,
-                    footer = urwid.AttrMap(
-                        urwid.Padding(
-                            urwid.Text(('default', ' '*shadow_len)),
-                            align='left',
+                    footer = urwid.Padding(
+                        urwid.AttrMap(
+                            urwid.Divider(
+                                BAR_SYMBOLS.VERTICAL[4]
+                                ),
+                            "reversed",
                             ),
-                        'reversed')
+                        left=shadow_len
+                        )
                     )
 
         super().__init__(box_w)
 
     def keypress(self, size, key):
         key = super().keypress(size, key)
-        if key in ('esc', 'q'):
+        if key in KEY_BINDINGS['close_popup']:
             self._emit('closed')
-        elif key in ('tab', 'shift tab'):
-            if self._buttons:
-                if self._frame_w.focus_position == 'footer':
-                    self._frame_w.focus_position = 'body'
-                else:
-                    self._frame_w.focus_position = 'footer'
         else:
             return key
         return None
@@ -2212,13 +2494,48 @@ class FocusableText(urwid.WidgetWrap):
         # Setting class variable `_selectable = True` does not work. Probably gets overwritten by the base class constructor.
         return True
 
-    def keypress(self, _size, key):  # pylint: disable=no-self-use
+    def keypress(self, _size, key):
         # When reimplementing selectable(), have to redefine keypress() too.
         # https://urwid.readthedocs.io/en/latest/reference/widget.html#urwid.Widget.selectable
         return key
 
     def __getattr__(self, attr):
         return getattr(self._text_w, attr)
+
+
+class ButtonBox(urwid.WidgetWrap):
+
+    signals = ["click"]
+
+    def __init__(self, label, on_press=None, user_data=None, align='center', decoration='[]'):
+        text_w = FocusableText(label, align=align)
+        if decoration == 'box':
+            w = LineBoxRoundCorners(text_w)
+        elif decoration is not None:
+            w = urwid.Columns(
+                [
+                    (len(decoration[0]), urwid.Text(decoration[0])),
+                    ("pack", text_w),
+                    (len(decoration[1]), urwid.Text(decoration[1])),
+                    ],
+                )
+        else:
+            w = text_w
+        super().__init__(w)
+        if on_press:
+            urwid.connect_signal(self, "click", on_press, user_data)
+
+    def keypress(self, size, key):
+        if self._command_map[key] != urwid.ACTIVATE:
+            return key
+        self._emit("click")
+        return None
+
+    def mouse_event(self, _size, event, button, _x, _y, _focus):
+        if button != 1 or not urwid.util.is_mouse_press(event):
+            return False
+        self._emit("click")
+        return True
 
 
 class LazyEvalListWalker(urwid.ListWalker):
@@ -2260,16 +2577,14 @@ class LazyEvalListWalker(urwid.ListWalker):
         try:
             self.contents.set_modified_callback(callback)
         except AttributeError:
-            logging.warning(
+            logger.warning(
                     "Changes to object will not be automatically updated: %s",
                     textwrap.shorten(str(self.contents), 150),
                     )
 
     def _remove_contents_modified_callback(self):
-        try:
+        with suppress(AttributeError):
             self.contents.set_modified_callback(noop)
-        except AttributeError:
-            pass
 
     def _modified(self):
         if self.focus >= len(self.contents):
@@ -2287,16 +2602,13 @@ class LazyEvalListWalker(urwid.ListWalker):
             raise IndexError
         return position + 1
 
-    def prev_position(self, position):  # pylint: disable=no-self-use
+    def prev_position(self, position):
         if position <= 0:
             raise IndexError
         return position - 1
 
     def set_focus(self, position):
         if position < 0 or position >= len(self.contents):
-            # NOTE: there is crash in this method that I can not reliably recproduce:
-                # Happens when I start a search through message widgets w `/` and mash the keyboard. Seems to only happen if I push many keys fast enough..
-                # This might well be an urwid bug
             raise IndexError
         self.focus = position
         self._modified()
@@ -2311,25 +2623,29 @@ class LazyEvalListWalker(urwid.ListWalker):
 class ViBindingsMixin(urwid.Widget):
 
     _KEY_MAP = {
-            'h':        'left',
-            'j':        'down',
-            'k':        'up',
-            'l':        'right',
-            'g':        'home',
-            'G':        'end',
-            'ctrl p':   'up',
-            'ctrl n':   'down',
+            'h': urwid.CURSOR_LEFT,
+            'j': urwid.CURSOR_DOWN,
+            'k': urwid.CURSOR_UP,
+            'l': urwid.CURSOR_RIGHT,
+            'g': urwid.CURSOR_MAX_LEFT,  # 'home'
+            'G': urwid.CURSOR_MAX_RIGHT, # 'end'
+            'ctrl p':   urwid.CURSOR_UP,
+            'ctrl n':   urwid.CURSOR_DOWN,
+            'ctrl b':   urwid.CURSOR_PAGE_UP,
+            'ctrl f':   urwid.CURSOR_PAGE_DOWN,
             }
 
-    def keypress(self, size, key):
-        key = super().keypress(size, key)  # sibling class's keypress() will be called ("cooperative super")
-        key_equiv = self._KEY_MAP.get(key)
-        if key_equiv:
-            return super().keypress(size, key_equiv)
-        return key
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for key, action in self._KEY_MAP.items():
+            # urwid's CommandMap does not have an `update()` method.
+            self._command_map[key] = action
+
+    def render(self, *arsg, **kwargs):
+        raise NotImplementedError
 
 
-class ListBoxPlus(ViBindingsMixin, urwid.ListBox):
+class ListBoxPlus(urwid.ListBox, ViBindingsMixin):
 
     """ListBox plus a few useful features.
 
@@ -2447,20 +2763,12 @@ class ContactWidget(FocusableText):
 
     def _get_name_markup(self):
         markup = []
-        name = self.contact.name
-        if name:
-            markup.append(name)
-        else:
-            name = self.contact.id
-            markup.append(name)
-            if name == cfg.username:
-                markup.append(self.NOTE_TO_SELF_MARKUP)
-            else:
-                profile_name = self.contact.profile_name
-                if profile_name:
-                    markup.append(('italic', ' ~' + profile_name))
+        name = self.contact.name_or_id
+        markup.append(name)
         if self.contact.is_group and not cfg.partition_contacts:
             markup.append(self.GROUP_MARKUP)
+        elif self.contact.id == cfg.username:
+            markup.append(self.NOTE_TO_SELF_MARKUP)
         return markup
 
     def _update_markup(self):
@@ -2575,7 +2883,7 @@ class ContactsListWidget(ListBoxPlus):
         else:
             group_contact_widgets = [ContactWidget(contact) for contact in sorted_contacts[0]]
             indiv_contact_widgets = [ContactWidget(contact) for contact in sorted_contacts[1]]
-            div_w = urwid.Divider('-')
+            div_w = urwid.Divider(HORIZ_LINE_DIV_SYM)
             group_cont_section_title = urwid.Text(('bold', '~~ Groups ~~'), align='center')
             indiv_cont_section_title = urwid.Text(('bold', '~~ Contacts ~~'), align='center')
             widgets = (
@@ -2588,10 +2896,8 @@ class ContactsListWidget(ListBoxPlus):
             self.contents = widgets
             self._contact_widgets_map = {w.contact.id: w for w in group_contact_widgets + indiv_contact_widgets}
         self._set_all_ws_unread_counts()
-        try:
+        with suppress(AttributeError): # If current_contact is None
             self._get_current_contact_widget().highlight = True
-        except AttributeError:  # current_contact is None
-            pass
         self.try_set_focus(0)
 
     def _set_all_ws_unread_counts(self):
@@ -2616,6 +2922,9 @@ class ContactsListWidget(ListBoxPlus):
         if status != 'send_failed':
             return
         current_contact = self._chats_data.current_contact
+        if current_contact is None:
+            # If contacts' update happens while sending, and current_contact no longer in contacts.
+            return
         envelope_contact_id = get_envelope_contact_id(envelope)
         if current_contact.id == envelope_contact_id:
             return
@@ -2653,10 +2962,8 @@ class ContactsListWidget(ListBoxPlus):
 
     def _unhighlight_current_contact_widget(self):
         # Remove highlighting from the "current" (not for long) contact's widget.
-        try:
+        with suppress(AttributeError): # If current_contact is None
             self._get_current_contact_widget().highlight = False
-        except AttributeError:  # current_contact is None
-            pass
 
     def _select_focused_contact(self, focus_widget=None):
         # The `focus_widget` parameter is passed through from caller to emit_signal. It specifies whether the focus should be set on `input`, `chat` or `contacts` widgets after switching to a new contact.
@@ -2708,11 +3015,11 @@ class ContactsListWidget(ListBoxPlus):
 
     def keypress(self, size, key):
         key = super().keypress(size, key)
-        if key == 'enter':
+        if key in KEY_BINDINGS['enter']:
             self._select_focused_contact(focus_widget='input')
-        elif key == 'right':
+        elif key in KEY_BINDINGS['open_contact_chat']:
             self._select_focused_contact()
-        elif key == 'U':
+        elif key in KEY_BINDINGS['mark_unread']:
             self._increment_focused_unread_count()
         else:
             return key
@@ -2722,7 +3029,7 @@ class ContactsListWidget(ListBoxPlus):
 class ContactsWindow(urwid.Frame):
     def __init__(self, contacts, chats_data):
         self.contacts_list_w = ContactsListWidget(contacts, chats_data)
-        self._wsearch = Edit(('bold', '/ '))
+        self._wsearch = BracketedPasteEdit(('bold', KEY_BINDINGS.search_sym))
 
         urwid.connect_signal(self._wsearch, 'postchange', self._on_search_text_changed)
 
@@ -2731,7 +3038,7 @@ class ContactsWindow(urwid.Frame):
         if not cfg.partition_contacts:
             self.header = urwid.Pile([
                 urwid.Text(('bold', 'Contacts'), align='center'),
-                urwid.Divider('-')
+                urwid.Divider(HORIZ_LINE_DIV_SYM)
                 ])
 
     def _start_search(self):
@@ -2761,12 +3068,12 @@ class ContactsWindow(urwid.Frame):
 
     def keypress(self, size, key):
         key = super().keypress(size, key)
-        if key == '/':
+        if key in KEY_BINDINGS['search_input']:
             self._start_search()
-        elif key == 'enter' and self.focus_position == 'footer':
+        elif key in KEY_BINDINGS['enter'] and self.focus_position == 'footer':
             self.focus_position = 'body'
             self.contacts_list_w.try_set_focus(0)
-        elif key == 'esc':
+        elif key in KEY_BINDINGS['clear']:
             self._remove_search()
         else:
             return key
@@ -2825,9 +3132,9 @@ class BracketedPasteEdit(Edit):
             self._paste_mode_on = True
         elif key == 'end paste':
             self._paste_mode_on = False
-        elif key == 'enter' and not (self._multiline_arg or self._paste_mode_on):
+        elif key in KEY_BINDINGS['enter'] and not (self._multiline_arg or self._paste_mode_on):
             return key
-        elif key == 'meta enter':
+        elif key in KEY_BINDINGS['input_newline']:
             # Allow inserting new lines with Alt+Enter. This is not a part of "bracketed paste mode" functionality.
             return super().keypress(size, 'enter')
         else:
@@ -2838,12 +3145,12 @@ class BracketedPasteEdit(Edit):
 class InputLine(BracketedPasteEdit):
     def __init__(self, **kwargs):
         self._cmd_history = CommandsHistory()
-        self._cmds = None
-        self._prompt = ('bold', '> ')  # In urwid's parlance, this is called 'caption'.
+        self.cmds = None
+        self._prompt = ('bold', '> ')
         super().__init__(self._prompt, **kwargs)
 
     def set_cmds(self, cmds):
-        self._cmds = cmds
+        self.cmds = cmds
 
     def _set_edit_text_move_cursor(self, txt, cursor_pos=-1):
         """Edit.set_edit_text() + Edit.set_edit_pos()
@@ -2859,10 +3166,10 @@ class InputLine(BracketedPasteEdit):
         # See also: there is an autocomplete in rr-/urwid_readline
         splitted_txt = txt.split(' ')
         if len(splitted_txt) > 1:
-            path, *messages = split_path(' '.join(splitted_txt[1:]))
+            path, message = partition_escaped(' '.join(splitted_txt[1:]))
 
             # Check we are trying to complete a path
-            if len(messages) > 0 or not is_path(path):
+            if message or not is_path(path):
                 return
 
             fullpath = os.path.expanduser(path)
@@ -2892,7 +3199,7 @@ class InputLine(BracketedPasteEdit):
         else:
             all_commands = [
                 cmd
-                for cmd in [tupl[0][0] for tupl in self._cmds.cmd_mapping]
+                for cmd in [tupl[0][0] for tupl in self.cmds.cmd_mapping]
                 if cmd.lower().startswith(txt[1:].lower())
             ]
             commonprefix = os.path.commonprefix(all_commands)
@@ -2906,23 +3213,23 @@ class InputLine(BracketedPasteEdit):
 
     def _keypress_cmd_mode(self, key, key_orig, txt):
         # Called when `txt.startswith(':')`
-        if key == 'enter':
-            if txt.strip() == ":":
-                action_request.set_status_line('Command missing after `:`')
+        if key in KEY_BINDINGS['enter']:
+            if txt.strip() == KEY_BINDINGS.cmd_sym:
+                action_request.set_status_line(f'Command missing after `{KEY_BINDINGS.cmd_sym}`')
                 return None
             cmd, *args = txt[1:].split(maxsplit=1)
-            self._cmds.exec(cmd, *args)
+            self.cmds.exec(cmd, *args)
             self._cmd_history.add(txt)
             self.set_edit_text('')
             self.set_caption(self._prompt)
-        elif key == 'tab' and not self.get_edit_text().endswith(' '):
+        elif key in KEY_BINDINGS['auto_complete'] and not self.get_edit_text().endswith(' '):
             self.auto_complete_commands(txt)
         elif key_orig in ('up', 'ctrl p'):
             # Since BracketedPasteEdit is based on Edit(multiline=True), the up / down / ctrl+p/n are consumed by the superclass, so need to check `key_orig`, before `super` method call.
-            prev_cmd = self._cmd_history.prev(txt)   # pylint: disable=not-callable; https://github.com/PyCQA/pylint/issues/3970
+            prev_cmd = self._cmd_history.prev(txt)
             self._set_edit_text_move_cursor(prev_cmd)
         elif key_orig in ('down', 'ctrl n'):
-            next_cmd = self._cmd_history.next(txt)   # pylint: disable=not-callable; https://github.com/PyCQA/pylint/issues/3970
+            next_cmd = self._cmd_history.next(txt)
             self._set_edit_text_move_cursor(next_cmd)
         else:
             return key
@@ -2936,27 +3243,27 @@ class InputLine(BracketedPasteEdit):
         if not txt or txt.isspace():
             self.set_caption(self._prompt)  # restore normal prompt
             return key
-        if txt.startswith(('/', ':')):
+        if txt.startswith((KEY_BINDINGS.search_sym, KEY_BINDINGS.cmd_sym)):
             self.set_caption('')  # set "prompt" to '/' or ':'
-            if key == 'esc':
+            if key in KEY_BINDINGS['clear']:
                 self.set_edit_text('')
                 self.set_caption(self._prompt)
                 return None
         else:
             self.set_caption(self._prompt)
         # Bind readline equivalents
-        if key == 'ctrl left':
+        if key in KEY_BINDINGS['readline_word_left']:
             return super().keypress(size, 'meta b')
-        if key == 'ctrl right':
+        if key in KEY_BINDINGS['readline_word_right']:
             return super().keypress(size, 'meta f')
         #if key == 'ctrl backspace':
             # uwrid registers 'ctrl backspace' as just 'backspace'.. Use 'ctrl w' or 'meta backspace' instead.
             #return super().keypress(size, 'ctrl w')
         # /end: Bind readline equivalents
-        if txt.startswith(':'):
+        if txt.startswith(KEY_BINDINGS.cmd_sym):
             return self._keypress_cmd_mode(key, key_orig, txt)
-        elif key == 'enter':
-            if txt.startswith('/'):
+        elif key in KEY_BINDINGS['enter']:
+            if txt.startswith(KEY_BINDINGS.search_sym):
                 return key
             action_request.send_message_curr_contact(txt)
             self.set_edit_text('')
@@ -2968,6 +3275,50 @@ class InputLine(BracketedPasteEdit):
 # #############################################################################
 # conversation widgets
 # #############################################################################
+
+
+class MessageReactionsWidget(urwid.WidgetWrap):
+
+    def __init__(self, emojis_markup, align):
+        self._align = align
+        method = self._init_row_w if not cfg.show_inline else self._init_col_w
+        self._text_w, display_w = method(emojis_markup)
+        super().__init__(display_w)
+
+    def _init_row_w(self, emojis_markup):
+        text_w = urwid.Text(emojis_markup, align=self._align)
+        react_pad_w = urwid.Padding(text_w, self._align, width=cfg.wrap_at)
+        react_sym_markup = '╰╴' if self._align == 'left' else '╶╯'
+        react_sym_w = urwid.Text(
+                react_sym_markup,
+                align='right' if self._align == 'left' else 'left',
+                )
+        cols = [
+                (DeliveryStatus.MARKUP_WIDTH + len(react_sym_markup), react_sym_w),
+                react_pad_w,
+                ]
+        if self._align == 'right':
+            cols.reverse()
+        react_cols_w = urwid.Columns(cols)
+        return text_w, react_cols_w
+
+    def _init_col_w(self, emojis_markup):
+        text_w = urwid.Text(self._col_w_markup(emojis_markup))
+        return text_w, text_w
+
+    def _col_w_markup(self, emojis_markup):
+        sep = BOX_SYMBOLS.LIGHT.VERTICAL_4_DASH  # '┊'
+        return (
+                [*emojis_markup, sep]
+                if self._align == 'right' else
+                [sep, *emojis_markup]
+                )
+
+    def update(self, emojis_markup):
+        if not cfg.show_inline:
+            self._text_w.set_text(emojis_markup)
+        else:
+            self._text_w.set_text(self._col_w_markup(emojis_markup))
 
 
 class MessageWidget(urwid.WidgetWrap):
@@ -2982,6 +3333,10 @@ class MessageWidget(urwid.WidgetWrap):
     MENTION_BRACKET_CHAR = chr(31)  # arbitrary non-printable char
     FORMAT_MENTION = {MENTION_BRACKET_CHAR: 'italic'}
     FORMATTING_RE = None
+
+    MARKUP_ELS_SEPARATOR = '\n'
+    SENDER_NAME_COL_WIDTH = 12
+    MSG_MARKUP_PRE = ()
 
     @classmethod
     def set_formatting_consants(cls, use_formatting):
@@ -3003,6 +3358,17 @@ class MessageWidget(urwid.WidgetWrap):
                 \1
             """,
             re.VERBOSE)
+        if cfg.show_inline == 'columns':
+            if not cfg.one_sided:
+                cls.SENDER_NAME_COL_WIDTH = 'pack'
+        else:
+            cls._get_inline_columns = lambda self: []
+            cls.MSG_MARKUP_PRE = (
+                cls._get_time_markup,
+                cls._get_sender_markup,
+                )
+            if cfg.show_inline == 'wrap':
+                cls.MARKUP_ELS_SEPARATOR = ' '
 
     def __init__(self, msg):
         self.msg = msg
@@ -3020,43 +3386,73 @@ class MessageWidget(urwid.WidgetWrap):
         self._status_w = urwid.Text(status_markup, self.align)
         status_w_valign = 'top' if self.align == 'left' else 'bottom'
         status_filler_w = urwid.Filler(self._status_w, status_w_valign)
-        cols = [(DeliveryStatus.MARKUP_WIDTH, status_filler_w), msg_pad_w]
+        cols = [(DeliveryStatus.MARKUP_WIDTH, status_filler_w), *self._get_inline_columns(), msg_pad_w]
         box_columns = [0]
         if self.align == 'right':
             cols.reverse()
-            box_columns = [1]
-        columns_w = urwid.Columns(cols, dividechars=1, box_columns=box_columns)
+            box_columns = [len(cols)-1]
+        self._columns_w = urwid.Columns(cols, dividechars=1, box_columns=box_columns)
         self._color = None if not cfg.color else cfg.color.for_message(msg)
-        display_w = urwid.AttrMap(columns_w, self._color, focus_map=REVERSED_FOCUS_MAP)
+        display_w = urwid.AttrMap(self._columns_w, self._color, focus_map=REVERSED_FOCUS_MAP)
         super().__init__(display_w)
         self._reactions_w = None
         self.update_reactions_w()
+        if cfg.show_message_padding:
+            self._add_pile_row(urwid.Divider(cfg.show_message_padding))
+
+    def _get_inline_columns(self):
+        return [
+                (width,
+                    urwid.Text(markup)
+                    if width == 'pack' else
+                    urwid.Padding(
+                        urwid.Text(markup, wrap='clip'),
+                        align='right',
+                        width='pack',
+                        )
+                    )
+                for width, markup in (
+                    ('pack', self._get_time_markup()),
+                    (self.SENDER_NAME_COL_WIDTH, self._get_sender_markup()),
+                ) if markup is not None
+                ]
 
     def _get_message_markup(self):
+        markups = []
+        if self.MSG_MARKUP_PRE:
+            # Show sender's name and message timesamp on the same line if both --show-names --show-message-time are true.
+            markups_list = [f(self) for f in self.MSG_MARKUP_PRE]
+            for elm in markups_list if self.align == 'left' else reversed(markups_list):
+                if elm:
+                    markups.extend((*elm, ' '))
+            markups = [markups]
         if 'typingMessage' in self.msg.envelope:
-            markups = (
-                self._get_sender_markup(),
-                [self.TYPING_INDICATOR_MARKUP],
-                )
+            markups.append(
+                    [self.TYPING_INDICATOR_MARKUP],
+                    )
         elif self.msg.envelope.get('callMessage') is not None:
-            markups = (self._get_call_message_markup(), )
+            markups.append(
+                    self._get_call_message_markup(),
+                    )
         elif getattr(self.msg, 'remote_delete', None):
-            markups = ([self.REMOTE_DELETE_MARKUP], )
+            markups.append(
+                    [self.REMOTE_DELETE_MARKUP],
+                    )
         elif get_envelope_sticker(self.msg.envelope) is not None:
-            markups = ([self.STICKER_MARKUP], )
+            markups.append(
+                    [self.STICKER_MARKUP],
+                    )
         else:
-            markups = (
-                self._get_sender_markup(),
-                self._get_quote_markup(),
-                self._get_text_markup(),
-                self._get_attachments_markup(),
-                )
-
+            markups.extend([
+                    self._get_quote_markup(),
+                    self._get_text_markup(),
+                    self._get_attachments_markup(),
+                    ])
         ret = []
         for markup in markups:
             if markup:
                 if ret:
-                    ret.append('\n')
+                    ret.append(self.MARKUP_ELS_SEPARATOR)
                 ret.extend(markup)
         return ret
 
@@ -3105,14 +3501,23 @@ class MessageWidget(urwid.WidgetWrap):
     def _get_attachments_markup(self):
         return self._get_attachments_markup_generic(self.msg.attachments)
 
+    def _get_time_markup(self):
+        if not cfg.show_message_time:
+            return None
+        time_markup = strftimestamp(self.msg.timestamp, cfg.show_message_time)
+        return [('italic', time_markup)]
+
     def _get_sender_markup(self):
         envelope = self.msg.envelope
         is_group = is_envelope_group_message(envelope)
         if not (is_group or cfg.show_names):
             return None
         if is_envelope_outgoing(envelope):
-            return [('bolditalic', 'You')] if cfg.show_names else None
-        sender_name = action_request.get_contact_name(self.msg.sender_num)
+            if not (cfg.show_names or cfg.show_inline=='columns' and cfg.one_sided):
+                return None
+            sender_name = 'Me'
+        else:
+            sender_name = action_request.get_contact_name(self.msg.sender_num)
         return [('bolditalic', sender_name)]
 
     def _get_quote_markup(self):
@@ -3121,20 +3526,21 @@ class MessageWidget(urwid.WidgetWrap):
             return None
         try:
             quote_author_num = quote['author']
-            quote_text = quote['text']
+            quote_text = textwrap.shorten(quote['text'], 70)
             quote_attachments = quote['attachments']
         except KeyError:
-            logging.error("Failed to extract a quote from %s", self.msg.envelope)
+            logger.error("Failed to extract a quote from %s", self.msg.envelope)
             return None
 
-        if self.align == 'left':
+        if cfg.show_inline:
+            ret = ['|> ']
+            sep = ' '
+        elif self.align == 'left':
             ret = ['| ']
-            newline_sep = '\n| '
-            quote_sep_line = newline_sep + '---'
+            sep = self.MARKUP_ELS_SEPARATOR + '| '
         else:
             ret = []
-            newline_sep = ' |\n'
-            quote_sep_line = '\n --- |'
+            sep = ' |' + self.MARKUP_ELS_SEPARATOR
 
         text_markup = self._get_text_markup_generic(
                 text=quote_text,
@@ -3142,7 +3548,7 @@ class MessageWidget(urwid.WidgetWrap):
                 ) or []
         for index, markup_element in enumerate(text_markup):
             try:
-                text_markup[index] = markup_element.replace('\n', newline_sep)
+                text_markup[index] = markup_element.replace('\n', sep)
             except AttributeError:
                 continue
 
@@ -3155,15 +3561,12 @@ class MessageWidget(urwid.WidgetWrap):
                 self._get_attachments_markup_generic(quote_attachments),
                 ):
             if m:
-                ret.append(newline_sep)
-                ret.extend(m)
-        if self.align == 'right':
+                ret.append(sep)
+                ret.extend((
+                    ('italic', el) for el in m
+                    ))
+        if self.align == 'right' and not cfg.show_inline == 'columns' or cfg.show_inline == 'wrap':
             ret.append(' |')
-
-        if len(markup_to_text(text_markup)) > 50:
-            # Additional separator after "long" quoted lines that might get soft-wrapped.
-            # 50 ~= 80 * 3/4 * 0.85  (assuming 80 columns, 3/4 for ChatWindow, 85% default wrap_at)
-            ret.append(quote_sep_line)
 
         return ret
 
@@ -3195,6 +3598,39 @@ class MessageWidget(urwid.WidgetWrap):
     def unhighlight(self):
         self._w.set_attr_map({None: self._color})
 
+    def _add_pile_row(self, row_w):
+        o_w = self._w.original_widget
+        if isinstance(o_w, urwid.Pile):
+            o_w.contents.append((row_w, o_w.options()))
+        else:
+            self._w.original_widget = urwid.Pile([o_w, row_w])
+
+    def _remove_pile_row(self, row_w):
+        o_w = self._w.original_widget
+        if not isinstance(o_w, urwid.Pile):
+            return
+        try:
+            o_w.contents.remove((row_w, o_w.options()))
+        except ValueError:
+            return
+        if len(o_w.contents) == 1:
+            self._w.original_widget = o_w.contents[0][0]
+
+    def _insert_column(self, pos, w, col_opts=('pack',)):
+        if pos == 'last':
+            pos = len(self._columns_w.contents)
+        self._columns_w.contents.insert(pos, (w, self._columns_w.options(*col_opts)))
+
+    def _remove_column(self, w=None, pos=None):
+        cols = self._columns_w.contents
+        if w is not None:
+            for pos, (widget, _opts) in enumerate(cols):  # pylint: disable=redefined-argument-from-local
+                if widget is w:
+                    break
+            else:
+                raise ValueError(f"Column with widget {w} not found")
+        del cols[pos]
+
     def update_reactions_w(self):
         try:
             reactions = self.msg.reactions
@@ -3209,31 +3645,23 @@ class MessageWidget(urwid.WidgetWrap):
             self._remove_reactions_w()
             return
         try:
-            self._reactions_w.set_text(emojis_markup)
+            self._reactions_w.update(emojis_markup)
         except AttributeError:
             self._add_reactions_w(emojis_markup)
 
     def _add_reactions_w(self, emojis_markup):
-        self._reactions_w = urwid.Text(emojis_markup, align=self.align)
-        react_pad_w = urwid.Padding(self._reactions_w, self.align, width=cfg.wrap_at)
-        react_sym_markup = '╰╴' if self.align == 'left' else '╶╯'
-        react_sym_w = urwid.Text(
-                react_sym_markup,
-                align='right' if self.align == 'left' else 'left',
-                )
-        cols = [
-                (DeliveryStatus.MARKUP_WIDTH + len(react_sym_markup), react_sym_w),
-                react_pad_w,
-                ]
-        if self.align == 'right':
-            cols.reverse()
-        react_cols_w = urwid.Columns(cols)
-        self._w.original_widget = urwid.Pile([self._w.original_widget, react_cols_w])
+        self._reactions_w = MessageReactionsWidget(emojis_markup, self.align)
+        if not cfg.show_inline:
+            self._add_pile_row(self._reactions_w)
+        else:
+            pos = 'last' if self.align == 'left' else 0
+            self._insert_column(pos, self._reactions_w, ('weight', 0.5))
 
     def _remove_reactions_w(self):
         if self._reactions_w is None:
             return
-        self._w.original_widget = self._w.original_widget.contents[0][0]
+        call_method = self._remove_column if cfg.show_inline else self._remove_pile_row
+        call_method(self._reactions_w)
         self._reactions_w = None
 
 
@@ -3279,11 +3707,9 @@ class MessageWidgetsCache:
         # This method is not be needed if self._cache is a weakref dictionary.
         key = self._hash(msg)
         key_adj = hash((msg.sender_num, timestamp_adj))
-        try:
+        with suppress(KeyError):
             # Theoretically, it's possible to get a race condition here if signal-cli returns adjusted timestamp before the msg with un-adjusted timestamp is added to the _cache.
             self._cache[key_adj] = self._cache.pop(key)
-        except KeyError:
-            pass
 
 
 class LazyEvalMessageListWalker(LazyEvalListWalker):
@@ -3308,7 +3734,7 @@ class ChatView(ListBoxPlus):
         def test_match(msg):
             if not msg.text:
                 return None
-            return txt in msg.text.casefold()
+            return txt.casefold() in msg.text.casefold()
         self.filter_contents(test_match, scope)
         self.try_set_focus(-1)
 
@@ -3326,7 +3752,7 @@ class ChatView(ListBoxPlus):
 
     def on_input_line_change(self, input_line_w, old_text):
         txt = input_line_w.get_edit_text()
-        if txt.startswith('/'):
+        if txt.startswith(KEY_BINDINGS.search_sym):
             self._update_search_results(txt[1:], old_text[1:])
         elif self.is_filter_on:
             self._reset_search()
@@ -3350,6 +3776,19 @@ class ChatView(ListBoxPlus):
                 # The `_contents_pre_filter` for this class always points to the `current_chat` list. So after `resend()` action, its last element is the new message.
             self.try_set_focus(-1)
 
+    def _focus_quoted_msg_w(self, envelope):
+        quote = get_envelope_quote(envelope)
+        if quote is None:
+            return
+        try:
+            quoted_msg_index = self.contents.index_ts(
+                    quote['id'],    # timestamp of orig message
+                    quote['author'],
+                    )
+        except (KeyError, ValueError):
+            return
+        self.try_set_focus(quoted_msg_index)
+
     def keypress(self, size, key):
         key = super().keypress(size, key)
         message_widget = self.focus
@@ -3357,31 +3796,33 @@ class ChatView(ListBoxPlus):
             return key
         envelope = message_widget.msg.envelope
 
-        if key in ('enter', 'right'):
+        if key in KEY_BINDINGS['select_message']:
             if self.is_filter_on:
                 self._reset_search(keep_curr_focused=True)
             elif get_envelope_msg(envelope) is not None:
-                action_request.open_attach(envelope) or action_request.open_urls(envelope)    # pylint: disable=expression-not-assigned
-        elif key == 'o':
-            action_request.open_urls(envelope) or action_request.open_attach(envelope)      # pylint: disable=expression-not-assigned
-        elif key == 'y':
+                ret = action_request.open_attach(envelope) or action_request.open_urls(envelope)
+                if not ret and get_envelope_quote(envelope):
+                    self._focus_quoted_msg_w(envelope)
+        elif key in KEY_BINDINGS['open_link_attach']:
+            _ = action_request.open_urls(envelope) or action_request.open_attach(envelope)
+        elif key in KEY_BINDINGS['copy_contents']:
             txt = get_envelope_msg(envelope)
             if not txt:
                 attachments = get_envelope_attachments(envelope)
                 if attachments is not None:
                     txt = ' '.join(get_attachment_path(attach) for attach in attachments)
-            clip.put(txt)
-        elif key == 'd':
+            action_request.copy_to_clipb(txt)
+        elif key in KEY_BINDINGS['delete_msg_local']:
             self._delete_message(message_widget)
-        elif key == 'r':
-            self._resend_message(message_widget.msg)
-        elif key == 'D':
+        elif key in KEY_BINDINGS['delete_msg_remote']:
             action_request.send_remote_delete_prompt(message_widget)
-        elif key == 'q':
-            # Replying / quoting not supported by signal-cli
-            # https://github.com/AsamK/signal-cli/issues/213
-            pass
-        elif key in ('R', 'e') and not message_widget.msg.not_repliable:
+        elif key in KEY_BINDINGS['resend_message'] and is_envelope_outgoing(envelope):
+            self._resend_message(message_widget.msg)
+        #elif key in KEY_BINDINGS['quote_reply'] and not message_widget.msg.not_repliable:
+            ## Replying / quoting not supported by signal-cli
+            ## https://github.com/AsamK/signal-cli/issues/213
+            #pass
+        elif key in KEY_BINDINGS['reaction_emoji_picker'] and not message_widget.msg.not_repliable:
             urwid.emit_signal(self, 'pick_reaction', size, self.calculate_visible(size, True))
         else:
             return key
@@ -3393,8 +3834,8 @@ class ChatWindow(urwid.Frame):
         self._title_widget = urwid.Text('', align='center')
         self.input_line_w = InputLine()
         self.chat_view = ChatView()
-        title_w_div = urwid.Pile([self._title_widget, urwid.Divider('-')])
-        input_w_div = urwid.Pile([urwid.Divider('-'), self.input_line_w])
+        title_w_div = urwid.Pile([self._title_widget, urwid.Divider(HORIZ_LINE_DIV_SYM)])
+        input_w_div = urwid.Pile([urwid.Divider(HORIZ_LINE_DIV_SYM), self.input_line_w])
         self._focusable_widgets = {'chat': 'body', 'input': 'footer'}
         super().__init__(self.chat_view, header=title_w_div, footer=input_w_div)
         urwid.connect_signal(self.input_line_w, 'postchange', self.chat_view.on_input_line_change)
@@ -3420,7 +3861,7 @@ class ChatWindow(urwid.Frame):
         else:
             memb_names = [memb.name_or_id for memb in contact.member_contacts]
             markup.append(' (')
-            markup.extend(textwrap.shorten(', '.join(memb_names), 80))
+            markup.append(textwrap.shorten(', '.join(memb_names), 80))
             markup.append(', ' if memb_names else 'only: ')
             markup.extend([('italic', 'You'), ')'])
         self._title_widget.set_text(markup)
@@ -3431,14 +3872,14 @@ class ChatWindow(urwid.Frame):
 
     def keypress(self, size, key):
         key = super().keypress(size, key)
-        if not self.input_line_w.edit_text.startswith('/'):
+        if not self.input_line_w.edit_text.startswith(KEY_BINDINGS.search_sym):
             return key
-        if key == 'esc':
+        if key in KEY_BINDINGS['clear']:
             return self.input_line_w.keypress(size, key)
-        if key == 'enter' and self.focus_widget_name == 'input':
+        if key in KEY_BINDINGS['enter'] and self.focus_widget_name == 'input':
             if not self.chat_view.is_filter_on:
                 # This clause is used for re-doing a search on a new chat contents after swtiching to a new contact.
-                urwid.emit_signal(self.input_line_w, 'postchange', self.input_line_w, '/')
+                urwid.emit_signal(self.input_line_w, 'postchange', self.input_line_w, KEY_BINDINGS.search_sym)
             if self.chat_view.contents:
                 self.focus_widget_name = 'chat'
             return None
@@ -3484,9 +3925,9 @@ class StatusLine(urwid.WidgetWrap):
     def keypress(self, size, key):
         # Keypresses are passed to this widget only when it has focus, which only happens when the prompt is on.
         key = super().keypress(size, key)
-        if key == 'enter':
+        if key in KEY_BINDINGS['enter']:
             self._prompt_response_callback(self._prompt.edit_text)
-        elif key == 'esc':
+        elif key in KEY_BINDINGS['clear']:
             self._prompt_response_callback(None)
         else:
             return key
@@ -3555,7 +3996,7 @@ class MessageInfo(ListBoxPlus):
         if reactions is not None:
             items.extend(self._get_reactions_ws(reactions))
 
-        if cfg.debug:
+        if 'debug' in cfg.log_level:
             items.extend(self._get_debug_info())
 
         super().__init__(items)
@@ -3638,48 +4079,67 @@ class MessageInfo(ListBoxPlus):
     def keypress(self, size, key):
         key = super().keypress(size, key)
         item = self.body[self.focus_position]
-        if key == 'y':
+        if key in KEY_BINDINGS['copy_contents']:
             try:
-                clip.put(item.get_path())
+                action_request.copy_to_clipb(item.get_path())
             except AttributeError:
                 markup = get_text_markup(item)
                 if len(markup) == 2 and isinstance(markup[0], tuple):
                     # The line is `Property : Value` type
-                    clip.put(markup[1])
+                    action_request.copy_to_clipb(markup[1])
                 else:
-                    clip.put(item.text)
-        elif key in ('enter', 'o'):
-            try:
+                    action_request.copy_to_clipb(item.text)
+        elif key in KEY_BINDINGS['enter'] | KEY_BINDINGS['open_link_attach']:
+            with suppress(AttributeError):
                 item.open_path()
-            except AttributeError:
-                pass
         else:
             return key
         return None
 
 
-class HelpDialog(ListBoxPlus):
+class HelpDialog(urwid.WidgetWrap):
     def __init__(self):
-        items = [
-                urwid.Divider(),
-                urwid.Text(
-                    "Please see README for the full list of commands and key bindings.",
+        _close_keys = " or ".join((
+                k.capitalize() for k in KEY_BINDINGS['close_popup'].keys
+                ))
+        items = [urwid.Text(
+                "Use "
+                "↑ and ↓ to navigate, "
+                "Enter to show, "
+                f"{_close_keys} to exit.",
+                align="center")]
+        buttons = [
+                ButtonBox(
+                    label, on_press,
+                    ) for label, on_press in (
+            ("Key bindings",
+                lambda _: action_request.open_in_pager(
+                    KEY_BINDINGS.help_format(
+                        action_request.get_terminal_size()[0]
+                        )
+                    )
+                ),
+            (":Commands",
+                lambda _: action_request.open_in_pager_commands_help()
+                ),
+            ("README",
+                lambda _: action_request.open_file_in_pager(SCLI_README_FILE)
+                ),
+            )]
+        items += (urwid.Padding(
+                    btn,
                     align='center',
-                    ),
+                    width="clip",
+                    ) for btn in buttons)
+        items = list(intersperse(
                 urwid.Divider(),
-                ]
-
-        def open_readme(_button):
-            action_request.open_file(SCLI_README_FILE)
-
-        btn_open_readme = urwid.Button('Open README', on_press=open_readme)
-        pad = urwid.Padding(btn_open_readme, align='center', width=len(btn_open_readme.label)+4)
-        items.append(pad)
-
-        super().__init__(items)
+                items,
+                ))
+        w = ListBoxPlus(items)
+        super().__init__(w)
 
 
-class ReactionPicker(ViBindingsMixin, urwid.WidgetWrap):
+class ReactionPicker(urwid.WidgetWrap, ViBindingsMixin):
     signals = ['closed']
 
     _emoji_regex = re.compile(
@@ -3691,9 +4151,9 @@ class ReactionPicker(ViBindingsMixin, urwid.WidgetWrap):
         signals = ['return']
 
         def keypress(self, size, key):
-            if key in ('j', 'k', 'q'):
+            if key in {'j', 'k'} | KEY_BINDINGS['close_popup'].keys:
                 return key
-            elif key == 'enter':
+            elif key in KEY_BINDINGS['enter']:
                 urwid.emit_signal(self, 'return', self, self.edit_text)
                 return None
             return super().keypress(size, key)
@@ -3701,12 +4161,14 @@ class ReactionPicker(ViBindingsMixin, urwid.WidgetWrap):
     def __init__(self, msg):
         self._msg = msg
         grid_items = [
-                urwid.Button(
+                ButtonBox(
                     label=emoji,
                     on_press=self._reaction_picked,
                     user_data=emoji,
+                    decoration=None,
                     ) for emoji in (
                     '💗',
+                    #'❤️', # shows up displaced to the right
                     '👍',
                     '👎',
                     '😂',
@@ -3715,13 +4177,13 @@ class ReactionPicker(ViBindingsMixin, urwid.WidgetWrap):
                     )
                 ]
         custom_emoji_input_w = self.EditEmoji(wrap='clip')
-        self._custom_emoji_text_w = urwid.Text('···', align='right')
+        self._custom_emoji_text_w = urwid.Text('>', align='right')
         grid_items.append(self._custom_emoji_text_w)
         grid_items.append(custom_emoji_input_w)
         grid_w = urwid.GridFlow(
                 grid_items,
-                cell_width=6,
-                h_sep=2,
+                cell_width=4,
+                h_sep=1,
                 v_sep=1,
                 align='center',
                 )
@@ -3744,7 +4206,7 @@ class ReactionPicker(ViBindingsMixin, urwid.WidgetWrap):
             self._emit('closed')
             action_request.send_reaction(self._msg, emoji)
         else:
-            self._custom_emoji_text_w.set_text('❌⚠️👉')
+            self._custom_emoji_text_w.set_text('❌👉')
 
 
 class PopUpPlaceholder(urwid.WidgetPlaceholder):
@@ -3752,13 +4214,14 @@ class PopUpPlaceholder(urwid.WidgetPlaceholder):
         super().__init__(w)
         self._orig_w = w
             # Urwid's terminology here might be confusing: "WidgetPlaceholder.original_widget" means "currently displayed widget", not the one it is originally initialized with.
+        self._help_w = HelpDialog()
 
     def _show_pop_up(
             self,
             widget,
             title='',
             buttons=True,
-            shadow_len=2,
+            shadow_len=0,
             remove_callback=None,
             **overlay_params
             ):
@@ -3769,12 +4232,12 @@ class PopUpPlaceholder(urwid.WidgetPlaceholder):
                 self._remove_pop_up,
                 user_args=[remove_callback]
                 )
-        overlay_args = dict(
-                align='center',
-                valign='middle',
-                width=('relative', 85),
-                height=('relative', 65),
-                )
+        overlay_args = {
+                'align': 'center',
+                'valign': 'middle',
+                'width': ('relative', 85),
+                'height': ('relative', 65),
+                }
         overlay_args.update(overlay_params)
 
         pop_up_overlay = urwid.Overlay(
@@ -3794,16 +4257,31 @@ class PopUpPlaceholder(urwid.WidgetPlaceholder):
         return self.original_widget is not self._orig_w
 
     def show_help(self):
-        self._show_pop_up(HelpDialog(), title='Help')
+        self._show_pop_up(
+                self._help_w,
+                title='Help',
+                buttons=False,
+                shadow_len=1,
+                width=43,
+                height=11,
+                )
 
     def show_message_info(self, message_widget):
         message_widget.highlight()
         info = MessageInfo(message_widget.msg)
-        fill = urwid.Filler(info, height=('relative', 100), top=1, bottom=1)
+        pad = urwid.Padding(
+                info,
+                align='right',
+                width=('relative', 88),
+                right=4,
+                )
+        fill = urwid.Filler(pad, height=('relative', 100), top=1, bottom=1)
         self._show_pop_up(
                 fill,
                 title='Message info',
+                shadow_len=1,
                 remove_callback=message_widget.unhighlight,
+                height=12,
                 )
 
     def show_reaction_picker(self, frame_top_bottom_method, size, visible):
@@ -3822,22 +4300,23 @@ class PopUpPlaceholder(urwid.WidgetPlaceholder):
                 right=2,
                 valign='bottom',
                 bottom = bottom_offset,
-                width=30,
+                width=20,
                 height=7,
                 )
 
     def keypress(self, size, key):
         key = super().keypress(size, key)
-        if not self._is_popup_shown:
+        if self._is_popup_shown:
             # When popup is shown, do not pass keys to other widgets until it's closed
-            return key
-        return None
+            return None
+        return key
 
 
 class MainWindow(urwid.WidgetWrap):
     def __init__(self, contacts, chats_data):
         self._chats_data = chats_data
         self.contacts_w = ContactsWindow(contacts, self._chats_data)
+        self._paste_mode = False
 
         self.chat_w = ChatWindow()
         contacts_box = LineBoxHighlight(self.contacts_w)
@@ -3938,26 +4417,37 @@ class MainWindow(urwid.WidgetWrap):
         self.focus_widget_name = 'chat'
 
     def keypress(self, size, key):
-        if key == 'esc':
+        if self._paste_mode:
+            if key == 'end paste':
+                self._paste_mode = False
+                return None
+            return key
+        if key in KEY_BINDINGS['clear']:
             action_request.set_status_line('')
         key = super().keypress(size, key)
-        if key == 'tab':
+        if key == 'begin paste':
+            self._paste_mode = True
+        if key in KEY_BINDINGS['focus_next_area']:
             self._focus_next()
-        elif key == 'shift tab':
+        elif key in KEY_BINDINGS['focus_prev_area']:
             self._focus_next(reverse=True)
-        elif key == ':':
+        elif key in KEY_BINDINGS['cmd_entry']:
             self.focus_widget_name = 'input'
             self.keypress(size, key)
-        elif key == '/' and self.focus_widget_name == 'chat':
+        elif key in KEY_BINDINGS['search_input'] and self.focus_widget_name == 'chat':
             self.focus_widget_name = 'input'
             self.keypress(size, key)
-        elif key in ('meta j', 'meta down'):
+        elif key in KEY_BINDINGS['open_next_chat']:
             self.contacts_w.contacts_list_w.select_next_contact()
-        elif key in ('meta k', 'meta up'):
+        elif key in KEY_BINDINGS['open_prev_chat']:
             self.contacts_w.contacts_list_w.select_next_contact(reverse=True)
-        elif key == '?':
+        elif key in KEY_BINDINGS['show_key_bindings']:
+            action_request.open_in_pager(KEY_BINDINGS.help_format(
+                action_request.get_terminal_size()[0]
+                ))
+        elif key in KEY_BINDINGS['show_help']:
             self.show_help()
-        elif key == 'i':
+        elif key in KEY_BINDINGS['show_message_info']:
             if self.focus_widget_name != 'chat':
                 return key
             message_widget = self.chat_w.chat_view.focus
@@ -3981,6 +4471,7 @@ class UrwidUI:
         # Shortcuts for deeply nested attributes
         self.contacts = self.main_w.contacts_w.contacts_list_w
         self.chat = self.main_w.chat_w.chat_view
+        self.input = self.main_w.chat_w.input_line_w
         self.msg_ws_cache = self.chat.body.msg_ws_cache
 
 
@@ -3993,22 +4484,78 @@ class Commands:
     def __init__(self, actions):
         self._actions = actions
         self.cmd_mapping = [
-            (['attach', 'a'], self._actions.attach),
-            (['edit', 'e'], self._actions.external_edit),
-            (['read', 'r'], self._actions.read),
-            (['attachClip', 'c'], self._actions.attach_clip),
-            (['openAttach', 'o'], self._actions.open_last_attach),
-            (['openUrl', 'u'], self._actions.open_last_url),
-            (['toggleNotifications', 'n'], self._actions.toggle_notifications),
-            (['toggleAutohide', 'h'], self._actions.toggle_autohide),
-            (['toggleContactsSort', 's'], self._actions.toggle_sort_contacts),
-            (['renameContact'], self._actions.rename_contact),
-            (['addContact'], self._actions.add_contact),
-            (['reload'], self._actions.reload),
-            (['help'], self._actions.show_help),
-            (['quit', 'q'], self._actions.quit),
+            (
+                ['attach', 'a'],
+                self._actions.attach,
+                "Send file attachment `:attach FILE [FILE…] [MESSAGE]`",
+                ),
+            (
+                ['edit', 'e'],
+                self._actions.external_edit,
+                "Edit message in external $EDITOR `:edit [FILENAME] [MESSAGE]`",
+                ),
+            (
+                ['read', 'r'],
+                self._actions.read,
+                "Send message with the contents of FILE or output of COMMAND `:read FILE` | `:read !COMMAND`",
+                ),
+            (
+                ['attachClip', 'c'],
+                self._actions.attach_clip,
+                "Send files in clipboard as message attachments",
+                ),
+            (
+                ['openAttach', 'o'],
+                self._actions.open_last_attach,
+                "Open attachment from the latest message with an attach in the current chat",
+                ),
+            (
+                ['openUrl', 'u'],
+                self._actions.open_last_url,
+                "Open URL from the latest message in the current chat with a URL in message text",
+                ),
+            (
+                ['toggleNotifications', 'n'],
+                self._actions.toggle_notifications,
+                "Toggle desktop notifications on or off",
+                ),
+            (
+                ['toggleAutohide', 'h'],
+                self._actions.toggle_autohide,
+                "Hide contacts pane when not in focus",
+                ),
+            (
+                ['toggleContactsSort', 's'],
+                self._actions.toggle_sort_contacts,
+                "Switch between sorting contacts alphabetically or by the most recent message",
+                ),
+            (
+                ['reload'],
+                self._actions.reload,
+                "Manual refresh of contacts data",
+                ),
+            (
+                ['renameContact'],
+                self._actions.rename_contact,
+                "Rename a contact `:renameContact [ID] NEW_NAME`",
+                ),
+            (
+                ['addContact'],
+                self._actions.add_contact,
+                "Add a new contact `:addContact NUMBER [NAME]`",
+                ),
+            (
+                ['help'],
+                self._actions.show_help,
+                "Show help `:help [keys|commands]`",
+                ),
+            (
+                ['quit', 'q'],
+                self._actions.quit,
+                "Exit the program",
+                ),
         ]
-        self._map = {cmd.lower(): fn for cmds, fn in self.cmd_mapping for cmd in cmds}
+        self._map = {cmd.lower(): fn for cmds, fn, _help in self.cmd_mapping for cmd in cmds}
 
     def exec(self, cmd, *args):
         fn = self._map.get(cmd.lower())
@@ -4027,11 +4574,32 @@ class Commands:
             if re.search(r"missing \d+ required positional argument", str(err)):
                 self._actions.set_status_line(f':{cmd} missing arguments')
                 return None
-            elif re.search(r"takes \d+ positional arguments? but \d+ were given", str(err)):
+            elif re.search(r"takes \d+ positional arguments? but \d+ (was|were) given", str(err)):
                 self._actions.set_status_line(f':{cmd} extra arguments')
                 return None
             else:
                 raise
+
+    def help_format(self, term_ncols=None):
+        cmd_col_width = 30
+        if term_ncols is None:
+            return '\n'.join((
+                f"{', '.join((f':{cmd}' for cmd in cmd_list)):{cmd_col_width}}"
+                f"{help_str}"
+                for cmd_list, _fn, help_str in self.cmd_mapping
+                ))
+        return '\n'.join((
+            str(urwid.Columns([
+                (
+                    cmd_col_width,
+                    urwid.Text(
+                        ', '.join((f':{cmd}' for cmd in cmd_list))
+                        ),
+                    ),
+                urwid.Text(help_str),
+                ]).render((term_ncols, )))
+            for cmd_list, _fn, help_str in self.cmd_mapping
+            ))
 
 
 class Actions:
@@ -4040,14 +4608,13 @@ class Actions:
         self._contacts = contacts
         self._chats_data = chats_data
         self._urwid_ui = urwid_ui
+        self._clip = Clip()
 
-    def reload(self):
-        self._contacts.reload()
+    def reload(self, callback=None, **callback_kwargs):
         if self._daemon.is_dbus_service_running:
-            self.update_groups_async()
+            self.update_contacts_async(callback, **callback_kwargs)
         else:
-            self._update_contacts_ui()
-                # _update_contacts_ui() is included in update_groups_async() callback because it needs to run _after_ groups are updated.
+            self.set_status_line("reload error: signal-cli daemon is not running")
 
     def _update_contacts_ui(self):
         self._urwid_ui.contacts.update()
@@ -4062,12 +4629,12 @@ class Actions:
     def set_status_line(self, text, append=False):
         self._urwid_ui.main_w.status_line.set_text(text, append)
 
-    def callf(self, *args, **kwargs):
+    def proc_run(self, *args, **kwargs):
         """Wrapper that logs and swallows the exceptions"""
         try:
-            return callf(*args, **kwargs)
+            return proc_run(*args, **kwargs)
         except (OSError, ValueError) as err:
-            logging.exception(err)
+            logger.exception(err)
             self.set_status_line(
                     '\n'.join([
                         str(err),
@@ -4085,8 +4652,8 @@ class Actions:
         for token, text in (('%s', sender), ('%m', message), ('%a', avatar)):
             text = text.replace(r"'", r"'\''")
             rmap[token] = text
-        rmap['_optionals'] = ('%s', '%m')
-        self.callf(cfg.notification_command, rmap, background=True)
+        rmap['_optionals'] = ('%s', '%m', '%a')
+        self.proc_run(cfg.notification_command, rmap, background=True)
         if not cfg.notification_no_bell:
             print('\a', end='')
 
@@ -4102,7 +4669,7 @@ class Actions:
 
         filename = ''
         if args:
-            filename, *message = split_path(*args)
+            filename, message = partition_escaped(*args)
 
         if is_path(filename):
             msg_file_path = os.path.expanduser(filename)
@@ -4114,22 +4681,20 @@ class Actions:
             message = args
         if message:
             with open(msg_file_path, "w", encoding="utf-8") as msg_file:
-                msg_file.write(*message)
+                msg_file.write(message)
 
         self._daemon.main_loop.stop()
         cmd = " ".join((cfg.editor_command, shlex.quote(msg_file_path)))
-        self.callf(cmd)
+        self.proc_run(cmd)
         self._daemon.main_loop.start()
 
-        with open(msg_file_path, 'r', encoding="utf-8") as msg_file:
+        with suppress(OSError), open(msg_file_path, 'r', encoding="utf-8") as msg_file:
             msg = msg_file.read().strip()
             if msg:
                 self.send_message_curr_contact(msg)
 
-        try:
+        with suppress(NameError):
             os.remove(tmpfile)
-        except NameError:
-            pass
 
     def read(self, path_or_cmd):
         message = ''
@@ -4138,10 +4703,10 @@ class Actions:
                 with open(os.path.expanduser(path_or_cmd), 'r', encoding="utf-8") as file:
                     message = file.read()
             except OSError as err:
-                logging.exception(err)
+                logger.exception(err)
                 self.set_status_line(str(err))
         elif path_or_cmd.startswith('!'):
-            proc = self.callf(
+            proc = self.proc_run(
                     path_or_cmd[1:].strip(),
                     capture_output=True,
                     )
@@ -4152,20 +4717,32 @@ class Actions:
         if message != '':
             self.send_message_curr_contact(message)
 
-    def attach(self, args):
-        attachment, *message = split_path(args)
-        attachment = os.path.expanduser(attachment)
-        if not os.path.isfile(attachment):
-            self.set_status_line('File does not exist: ' + attachment)
+    def attach(self, string):
+        files = []
+        while string:
+            file_path, string_rest = partition_escaped(string)
+            if not is_path(file_path):
+                break
+            file_path = Path(file_path).expanduser()
+            if not file_path.is_file():
+                self.set_status_line(f"File does not exist: {file_path}")
+                return
+            files.append(str(file_path))
+            string = string_rest
+        if not files:
+            self.set_status_line(f"No attachment files provided in {string!r}")
             return
-        self.send_message_curr_contact(*message, attachments=[attachment])
+        self.send_message_curr_contact(string, attachments=files)
 
     def attach_clip(self, *message):
-        files = clip.files()
+        files = self._clip.files_list()
         if files:
             self.send_message_curr_contact(*message, attachments=files)
         else:
-            self.set_status_line('Clipboard is empty.')
+            self.set_status_line('No files in clipboard.')
+
+    def copy_to_clipb(self, text):
+        self._clip.put(text)
 
     def send_reaction(self, msg, emoji):
         is_remove = not emoji
@@ -4186,26 +4763,13 @@ class Actions:
 
     def open_file(self, path):
         if not os.path.exists(path):
-            logging.warning("File does not exist: %s", path)
+            logger.error("File does not exist: %s", path)
             self.set_status_line('File does not exist: ' + path)
             return None
-        return self.callf(cfg.open_command, {'%u': path}, background=True)
+        return self.proc_run(cfg.open_command, {'%u': path}, background=True)
 
     def open_attach(self, envelope):
         attachments = get_envelope_attachments(envelope)
-        if not attachments:
-            quote = get_envelope_quote(envelope)
-            if quote is not None and quote.get('attachments'):
-                try:
-                    msg_orig = self._chats_data.chats.get_msg_for_timestamp(
-                            envelope,
-                            quote['id'],    # timestamp of orig message
-                            quote['author'],
-                            )
-                except (KeyError, ValueError):
-                    pass
-                else:
-                    self.open_attach(msg_orig.envelope)
         if attachments:
             for attachment in attachments:
                 file_path = get_attachment_path(attachment)
@@ -4227,7 +4791,7 @@ class Actions:
                 return
 
     def open_url(self, url):
-        return self.callf(cfg.open_command, {'%u': url}, background=True)
+        return self.proc_run(cfg.open_command, {'%u': url}, background=True)
 
     def open_urls(self, envelope):
         txt = get_envelope_msg(envelope)
@@ -4284,7 +4848,7 @@ class Actions:
         :renameContact new name here          -> rename current contact or group
         """
         try:
-            number, new_name = split_path(args)
+            number, new_name = partition_escaped(args)
             if not is_number(number):
                 for contact_id, contact in self._contacts.map.items():
                     if contact.name == number:
@@ -4346,24 +4910,43 @@ class Actions:
                 callback_finally=message_widget.unhighlight,
                 )
 
-    def update_groups_async(self):
-        def on_groups_updated():
-            self._contacts.set_groups_membership()
+    def update_contacts_async(self, callback=None, **callback_kwargs):
+        def on_contacts_updated():
+            current_contact = self._chats_data.current_contact
+            if current_contact is not None and current_contact.id not in self._contacts.map:
+                self._chats_data.current_contact = None
             self._update_contacts_ui()
-        with self._daemon.callback_finally(on_groups_updated):
-            for group in self._contacts.groups:
-                self._daemon.get_group_name(
-                        group.id,
-                        callback=lambda name, group=group: group.update_record(
-                            {'name': strip_non_printable_chars(name)}
-                            )
-                        )
-                self._daemon.get_group_members(
-                        group.id,
-                        callback=lambda members_ids, group=group: setattr(
-                            group, 'members_ids', members_ids
-                            )
-                        )
+            self._chats_data.contacts_cache = self._contacts.serialize()
+            self._daemon.unpause_message_processing()
+            if callback is not None:
+                callback(**callback_kwargs)
+        self._daemon.pause_message_processing()
+        self._update_indiv_contacts_async(
+                self._update_groups_async,
+                on_contacts_updated,
+                )
+
+    def _update_indiv_contacts_async(self, callback, *cb_args, **cb_kwargs):
+        def on_indiv_contacts_updated(contacts_dict):
+            self._contacts.update(contacts_dict, clear=True)
+            callback(*cb_args, **cb_kwargs)
+        self._daemon.get_indiv_contacts(
+                callback=on_indiv_contacts_updated
+                )
+
+    def _update_groups_async(self, callback, *cb_args, **cb_kwargs):
+        def on_got_groups_dicts(groups_dict):
+            self._contacts.update(groups_dict)
+            self._contacts.set_groups_membership()
+            callback(*cb_args, **cb_kwargs)
+        def on_got_groups_ids(groups_ids):
+            self._daemon.populate_groups_dict(
+                    groups_ids,
+                    callback=on_got_groups_dicts,
+                    )
+        self._daemon.get_groups_ids(
+                callback=on_got_groups_ids
+                )
 
     def show_new_msg_notifications(self, msg):
         sender_name = self.get_contact_name(msg.sender_num)
@@ -4432,7 +5015,8 @@ class Actions:
         except TypeError:
             return
         notif = textwrap.shorten(notif, 80)
-        self.send_desktop_notification(sender_name, msg_text, contact_avatar)
+        if reaction_envelope is None or cfg.notify_on_reactions:
+            self.send_desktop_notification(sender_name, msg_text, contact_avatar)
         if (self._chats_data.current_contact is None
                 or msg.contact_id != self._chats_data.current_contact.id):
             self.set_status_line(notif)
@@ -4444,6 +5028,9 @@ class Actions:
     def _get_contact_avatar(self, contact_id):
         contact = self._contacts.get_by_id(contact_id)
         return contact.avatar if contact else None
+
+    def get_terminal_size(self):
+        return self._urwid_ui.loop.screen.get_cols_rows()
 
     def check_cmd_for_current_contact(self, fn):
         return (
@@ -4458,8 +5045,49 @@ class Actions:
                     )
                 )
 
-    def show_help(self):
-        self._urwid_ui.main_w.show_help()
+    def open_in_pager(self, contents):
+        """Pause urwid's loop and open `contents` in the system pager"""
+        # It's easy to implement a simple pager in urwid itself, but it's more convenient for the users to keep the configuration and key bindings they are familiar with from their system-wide pager program.
+        env_vars = None
+        if "LESS" in os.environ:
+            # Modify $LESS to prevent `less` from exiting when the bottom of the output is rearched. Clear the screen before showing the output.
+            env_vars = os.environ.copy()
+            env_vars["LESS"] += " -+FX"
+        self._daemon.main_loop.stop()
+        self.proc_run(cfg.pager_command, input=contents, env=env_vars)
+        self._daemon.main_loop.start()
+
+    def open_file_in_pager(self, path):
+        try:
+            with open(path, encoding="utf-8") as fo:
+                contents = fo.read()
+        except OSError:
+            contents = f"Error: could not open file: {path}"
+        self.open_in_pager(contents)
+
+    def open_in_pager_commands_help(self):
+        self.open_in_pager(
+                self._urwid_ui.input.cmds.help_format(
+                    self.get_terminal_size()[0]
+                    )
+                )
+
+    def show_help(self, *topic):
+        try:
+            topic = topic[0]
+        except IndexError:
+            self._urwid_ui.main_w.show_help()
+            return
+        if "keys".startswith(topic):
+            self.open_in_pager(
+                    KEY_BINDINGS.help_format(
+                        self.get_terminal_size()[0]
+                        )
+                    )
+        elif "commands".startswith(topic):
+            self.open_in_pager_commands_help()
+        else:
+            self.set_status_line(f":help for {topic!r} not found")
 
     @staticmethod
     def quit():
@@ -4484,6 +5112,206 @@ action_request = ActionRequest()
 
 
 # #############################################################################
+# key bindings
+# #############################################################################
+
+
+class KeyBindings:
+
+    class Binding():
+
+        __slots__ = ("keys", "descr")
+
+        def __init__(self, keys, descr):
+            self.keys = keys
+            self.descr = descr
+
+        def __contains__(self, item):
+            return item in self.keys
+
+        def __or__(self, other):
+            return self.keys.__or__(other.keys)
+
+        def __repr__(self):
+            return f"{self.__class__.__name__}(keys={self.keys}, descr={self.descr!r})"
+
+        @property
+        def a_key(self):
+            """Return one (any) element from the set `self.keys`."""
+            for key in self.keys:
+                return key
+
+    _MAP_DEFAULT = {
+        # Format:
+        # 'action_name': Binding(
+            # {'key1', 'key2', …},
+            # "help string"
+            # )
+        'show_key_bindings': Binding(
+            {'?'},
+            "Show current key bindings",
+            ),
+        'show_help': Binding(
+            {'f1'},
+            "Open help pop-up",
+            ),
+        'copy_contents': Binding(
+            {'y'},
+            "Copy message contents or details",
+            ),
+        'show_message_info': Binding(
+            {'i'},
+            "Show message details",
+            ),
+        'open_link_attach': Binding(
+            {'o'},
+            "Open attachment or URL in the message",
+            ),
+        'close_popup': Binding(
+            {'q', 'esc'},
+            "Close pop-up",
+            ),
+        'focus_next_area': Binding(
+            {'tab'},
+            "Switch focus to next element",
+            ),
+        'focus_prev_area': Binding(
+            {'shift tab'},
+            "Switch focus to previous element",
+            ),
+        'open_contact_chat': Binding(
+            {'right', 'l'},
+            "Show contact's conversation",
+            ),
+        'mark_unread': Binding(
+            {'U'},
+            "Mark conversation unread",
+            ),
+        'enter': Binding(
+            {'enter'},
+            "Open / submit",
+            ),
+        'clear': Binding(
+            {'esc'},
+            "Exit or remove notifications",
+            ),
+        'auto_complete': Binding(
+            {'tab'},
+            "Auto-complete input text",
+            ),
+        'search_input': Binding(
+            {'/'},
+            "Filter contents matching input",
+            ),
+        'input_newline': Binding(
+            {'meta enter'},
+            "Insert newline",
+            ),
+        'cmd_entry': Binding(
+            {':'},
+            "Command prompt",
+            ),
+        'open_next_chat': Binding(
+            {'meta j', 'meta down'},
+            "Open next chat",
+            ),
+        'open_prev_chat': Binding(
+            {'meta k', 'meta up'},
+            "Open previous chat",
+            ),
+        'readline_word_left': Binding(
+            {'ctrl left'},
+            "Move to the previous word in input",
+            ),
+        'readline_word_right': Binding(
+            {'ctrl right'},
+            "Move to the next word in input",
+            ),
+        'select_message': Binding(
+            {'enter', 'right', 'l'},
+            "Focus message or open its attachments",
+            ),
+        'delete_msg_local': Binding(
+            {'d'},
+            "Remove message from local history",
+            ),
+        'delete_msg_remote': Binding(
+            {'D'},
+            "Remove a message from a chat for all participants",
+            ),
+        'resend_message': Binding(
+            {'r'},
+            "Resend a failed-to-send message",
+            ),
+        #'quote_reply': Binding(
+            #{'r'},
+            #"Quote original message in a reply",
+            #),
+            ### Not implemented
+        'reaction_emoji_picker': Binding(
+            {'R', 'e'},
+            "Send an emoji reaction for a message",
+            ),
+        }
+
+    def __init__(self):
+        self._map = self._MAP_DEFAULT
+        self.cmd_sym = ':'
+        self.search_sym = '/'
+
+    def __getitem__(self, item):
+        return self._map[item]
+
+    def set(self, binds):
+        if not binds:
+            return
+        sep = ':'
+        keys_sep = ','
+        for kb in binds:
+            action, keys_str = kb.split(sep, 1)
+            if not keys_str:
+                sys.exit(f"Error parsing key bind {kb!r} - missing keys")
+            keys = set(keys_str.split(keys_sep))
+            if '' in keys:
+                # Allow keys_sep itself be used as a key
+                keys.remove('')
+                keys.add(keys_sep)
+            self._map[action].keys = keys
+        self.cmd_sym = self._map['cmd_entry'].a_key
+        self.search_sym = self._map['search_input'].a_key
+
+    def help_format(self, term_ncols=None):
+        key_col_width = 20
+        act_col_width = 25
+        key_sorted = sorted(self._map.items(), key=lambda t: [
+                    k.lower() for k in t[1].keys
+                    ])
+        if term_ncols is None:
+            ret = f"{'[KEY]':{key_col_width}} {'[ACTION]':{act_col_width}} [DESCRIPTION]\n"
+            ret += '\n'.join((
+                f"{', '.join(bind.keys):{key_col_width}} {action:{act_col_width}} {bind.descr}" for action, bind in key_sorted
+                ))
+        else:
+            ret = str(urwid.Columns([
+                (key_col_width, urwid.Text("[KEY]")),
+                (act_col_width, urwid.Text("[ACTION]")),
+                urwid.Text("[DESCRIPTION]"),
+                ]).render((term_ncols, ))) + '\n'
+            ret += '\n'.join((
+                str(urwid.Columns([
+                    (key_col_width, urwid.Text(', '.join(bind.keys))),
+                    (act_col_width, urwid.Text(action)),
+                    urwid.Text(bind.descr),
+                    ]).render((term_ncols, )))
+                for action, bind in key_sorted
+                ))
+        return ret
+
+
+KEY_BINDINGS = KeyBindings()
+
+
+# #############################################################################
 # Coordinate
 # #############################################################################
 
@@ -4492,7 +5320,7 @@ class Coordinate:
     def __init__(self):
         self._chats_data = ChatsData(cfg.save_history)
         sigdata = SignalData(cfg.username)
-        self._contacts = Contacts(sigdata)
+        self._contacts = Contacts(sigdata, self._chats_data.contacts_cache)
         self._ui = UrwidUI(self._contacts, self._chats_data)
         self.daemon = Daemon(self._ui.loop, cfg.username)
         self._actions = Actions(self.daemon, self._contacts, self._chats_data, self._ui)
@@ -4580,51 +5408,78 @@ class Coordinate:
         self._add_reaction(envelope)
         # NOTE: When attempting to _replace_ an emoji with anoter one 'send_fail's, the old one will be removed (not shown) locally in scli, while continuing to be visible for the original recepients.
 
-    def _on_receive_message(self, envelope):
-        logging.info('MESSAGE: %s', envelope)
-        contact_id = get_envelope_contact_id(envelope)
-        if contact_id not in self._contacts.map:
-            if not self._on_unknown_contact(envelope):
-                return
-
+    def _process_msg_envelope(self, envelope):
         sender_num = get_envelope_sender_id(envelope)
         self._chats_data.typing_indicators.remove(sender_num)
-
         msg = self._chats_data.chats.add_envelope(envelope)
         self._on_new_message(msg)
 
-    def _on_unknown_contact(self, envelope):
-        logging.info("Message from unknown contact: %s", envelope)
-        self._actions.reload()
+    def _on_receive_message(self, envelope):
+        logger.info('Message envelope: %s', pprint.pformat(envelope))
         contact_id = get_envelope_contact_id(envelope)
-        try:
-            return self._contacts.map[contact_id]
-        except KeyError:
-            pass
-        logging.error("Message from unknown contact: %s", envelope)
-        sender_num = get_envelope_sender_id(envelope)
-        msg_text = get_envelope_msg(envelope)
-        self._actions.set_status_line([
-            'Message from unknown chat ',
-            repr(contact_id),
-            '\n',
-            (sender_num + ': ' if sender_num != contact_id else ''),
-            repr(msg_text),
-            ])
-        self._actions.send_desktop_notification(sender_num, msg_text)
-        return None
+        if contact_id in self._contacts.map:
+            self._process_msg_envelope(envelope)
+        else:
+            def after_contacts_reload(new_contact):
+                if new_contact is not None:
+                    self._process_msg_envelope(envelope)
+            self._on_unknown_contact(envelope, callback=after_contacts_reload)
+
+    def _on_unknown_contact(self, envelope, callback):
+        logger.info("Message from unknown contact: %s", envelope)
+        def after_contacts_loaded():
+            contact_id = get_envelope_contact_id(envelope)
+            contact = self._contacts.map.get(contact_id)
+            if contact is not None:
+                return callback(contact)
+
+            logger.error("Message from unknown contact: %s", envelope)
+            sender_info = (
+                    envelope.get("sourceName")
+                    or
+                    f"UUID: {contact_id}"
+                    )
+            msg_text = get_envelope_msg(envelope)
+            self._actions.set_status_line([
+                'Message from an unknown chat: ',
+                repr(sender_info),
+                '\n',
+                repr(msg_text),
+                '\n',
+                'Accept this contact on the primary device first.',
+                ])
+            self._actions.send_desktop_notification(sender_info, msg_text)
+
+            contact_temp = Contact({
+                "number": contact_id,
+                "name": (
+                    envelope.get("sourceName") or
+                    envelope.get("sourceNumber") or
+                    envelope.get("source")[:10] + "..."
+                    ) + " [UNKNOWN CONTACT]"
+                })
+            self._contacts.map[contact_id] = contact_temp
+            self._contacts.indivs.add(contact_temp)
+            with suppress(KeyError, TypeError):
+                envelope["dataMessage"]["message"] += "\n~~~\n[Message from an unknown contact. Accept on the primary device first]\n~~~"
+            self._chats_data.chats.add_envelope(envelope)
+            self._chats_data.unread_counts[contact_id] += 1
+            self._ui.contacts.update()
+
+            return callback(contact)
+        self._actions.reload(callback=after_contacts_loaded)
 
     def _on_receive_sync_message(self, envelope):
         self._on_sending_message(envelope)
         self._on_sending_done(envelope)
 
-    def _on_new_message(self, msg):
+    def _on_new_message(self, msg, increment_unread_count=True):
         self._ui.contacts.on_new_message(msg)
         contact_id = msg.contact_id
         if (self._chats_data.current_contact is not None
                 and contact_id == self._chats_data.current_contact.id):
             self._ui.chat.try_set_focus(-1)
-        else:
+        elif increment_unread_count:
             self._chats_data.unread_counts[contact_id] += 1
             self._ui.main_w.update_unread_count(contact_id)
         self._actions.show_new_msg_notifications(msg)
@@ -4646,7 +5501,7 @@ class Coordinate:
             # Do not show notificitions for sync messages from linked devices
             return
         if msg is not None:
-            self._on_new_message(msg)
+            self._on_new_message(msg, increment_unread_count=cfg.notify_on_reactions)
             # Not focusing on the received reaction message (same behavior as signal-desktop)
         else:
             # Show a notification for reaction to an "unknown" message (not in Chats)
@@ -4655,27 +5510,29 @@ class Coordinate:
             msg.add_reaction(envelope)
             self._actions.show_new_msg_notifications(msg)
 
-    def _on_daemon_log(self, log_line):
-        if log_line.startswith("ERROR") and not self.daemon.is_dbus_service_running:
+    def _on_daemon_log(self, event, log_line):
+        if event == "daemon_stopped":
             self._actions.set_status_line([
                 "signal-cli daemon has stopped:\n   ",
                 log_line,
                 "\nRestart scli to restart the daemon."
                 ])
-        elif "in use by another instance" in log_line:
+        elif event == "another_instance_running":
             self._actions.set_status_line([
                 "signal-cli: Config file is in use by another instance, waiting…\n",
                 "Stop previously launched signal-cli processes to continue.",
                 ])
+        elif event == "another_instance_stopped":
+            self._actions.set_status_line("Initializing signal-cli daemon... ")
 
     def _on_daemon_started(self):
-        logging.info("signal-cli dbus service started")
+        logger.info("signal-cli dbus service started")
         self._actions.set_status_line("Initializing signal-cli daemon... Done")
         def clear_status_line(*_args):
             self._actions.set_status_line("")
         self._ui.loop.set_alarm_in(2, clear_status_line)
-        self._actions.update_groups_async()
-        self.daemon.get_signal_cli_version(callback=logging.info)
+        self._actions.update_contacts_async()
+        self.daemon.get_signal_cli_version(callback=logger.info)
 
     def _on_contact_selected(self, contact, focus_widget):
         self._chats_data.current_contact = contact
@@ -4707,7 +5564,7 @@ class Coordinate:
                 self._on_new_message(msg)
 
     def _on_contacts_sync(self):
-        logging.info("Received contacts sync message, reloading signal-cli contacts")
+        logger.info("Received contacts sync message, reloading signal-cli contacts")
         self._actions.reload()
 
     def _on_remote_delete(self, envelope):
@@ -4733,21 +5590,34 @@ class Coordinate:
         msg_w.reload_markup()
 
     def _on_untrusted_identity_err(self, envelope):
-        notification = [
-            "Contact's safety number has changed: ",
-            envelope.get('target') or envelope['source'],
-            " (they might have reinstalled signal). ",
-            "Run `signal-cli trust …` to resolve.",
-            ]
-        sender = envelope['source']
-        if sender != self._contacts.sigdata.own_num:
-            # NOTE: Not using desktop notifications: they would be shown on every contact_typing event.
+        contact_id = envelope.get('target')
+        if contact_id is not None:
+            # Message sent to an untrusted identity
             notification = [
-                    "Could not decrypt a new message from ",
-                    repr(sender),
-                    "\n",
-                    ] + notification
+                "Contact's safety number has changed: ",
+                contact_id,
+                " (they might have reinstalled signal). ",
+                "Run `signal-cli trust …` to resolve.",
+                ]
+            self._actions.set_status_line(notification)
+            return
+        # Message received from an untrusted identity
+        contact_id = envelope['source']
+        message = f"Message not decrypted: safety number with {contact_id} has changed"
+        envelope["dataMessage"] = {
+                "message": '[' + message + ']'
+                }
+        envelope["_received_timestamp"] = get_current_timestamp_ms()
+        envelope["_artificialEnvelope"] = "untrustedIdentity"
+        msg = self._chats_data.chats.add_envelope(envelope)
+        self._on_new_message(msg)
+        notification = message + " (they might have reinstalled signal).\nRun `signal-cli trust …` to resolve."
         self._actions.set_status_line(notification)
+
+    def _on_user_unregistered_err(self, envelope):
+        self._actions.set_status_line(
+                f"Contact {envelope.get('target')} has unregistered. Can not send messages until they re-register."
+                )
 
     def _on_receive_sticker(self, envelope):
         msg = self._chats_data.chats.add_envelope(envelope)
@@ -4795,13 +5665,28 @@ class CustomDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
     """
 
     def _get_help_string(self, action):
-        if action.default in (None, False):
+        if action.default in (None, False) or " (default: " in action.help:
             return action.help
         return super()._get_help_string(action)
 
 
+class _VersionFuncAction(argparse._VersionAction):  # pylint: disable=protected-access
+    """Allow a callable as an argument to the 'version' action."""
+
+    def __call__(self, *args, **kwargs):
+        with suppress(TypeError):
+            self.version = self.version()
+        super().__call__(*args, **kwargs)
+
+
+class ArgumentParserVersionFunc(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register('action', 'version', _VersionFuncAction)
+
+
 def make_arg_parser():
-    parser = argparse.ArgumentParser(
+    parser = ArgumentParserVersionFunc(
         formatter_class=CustomDefaultsHelpFormatter,
     )
 
@@ -4818,7 +5703,7 @@ def make_arg_parser():
         '-n',
         '--name',
         default='scli',
-        help='Device name that will be shown in "Linked devices" list on master device.',
+        help='Device name that will be shown in "Linked devices" list on primary device.',
     )
 
     parser.add_argument(
@@ -4857,13 +5742,18 @@ def make_arg_parser():
     parser.add_argument(
         '-G',
         '--clipboard-get-command',
-        help='Command used by `:attachClip` to get a list of files to send as attachments. Should return one absolute file path per line. If not set, `xclip` is used.',
+        help='Command used by `:attachClip` to get the list of files to send as message attachments. Should return absolute file paths separated by newline characters. If not set, %(prog)s checks if `wl-clipboard` or `xclip` are installed.',
     )
 
     parser.add_argument(
         '-P',
         '--clipboard-put-command',
-        help='Command to put text on clipboard. %%s will be replaced with the text. If not set, `xclip` is used.',
+        help="Command used to copy text to clipboard. Text will be sent to command's stdin.  If not set, %(prog)s checks if `wl-clipboard` or `xclip` are installed. (example: xsel -ib)",
+    )
+
+    parser.add_argument(
+        '--pager-command',
+        help='Command used to process the output of help messages, e.g. the list of key bindings. If not set, %(prog)s checks among `$PAGER`, `pager`, `less`, `more`.',
     )
 
     parser.add_argument(
@@ -4879,14 +5769,28 @@ def make_arg_parser():
     parser.add_argument(
         '--log-file',
         default=SCLI_LOG_FILE,
-        help='Path to the log file. If not explicitly specified, logs are written only if `--debug` or `--save-history` are on.',
+        help='Path to the log file. Logs are written only if `--log-file` or `--log-level` is explicitly set.',
     )
+
+    parser.add_argument(
+            "--log-level",
+            action="append",
+            default=["all:warning"],
+            help=f"Set logging level {{{','.join(logging_levels_list())}}} (default: warning)",
+            )
+
 
     parser.add_argument(
         '-n',
         '--enable-notifications',
         action='store_true',
-        help='Enable desktop notifications. (Also see --notification-command)',
+        help='Enable desktop notifications. (See also --notification-command)',
+    )
+
+    parser.add_argument(
+        '--notify-on-reactions',
+        action='store_true',
+        help="Show notifications on receiving reaction messages.",
     )
 
     parser.add_argument(
@@ -4918,6 +5822,14 @@ def make_arg_parser():
     )
 
     parser.add_argument(
+        '-k',
+        '--key-bind',
+        action='append',
+        metavar='ACTION:KEY[,KEY]',
+        help="Modify key bindings: assign KEYs to ACTION. Use `?` in %(prog)s to display the list of available ACTIONs.",
+    )
+
+    parser.add_argument(
         '--one-sided',
         action='store_true',
         help='Left-align both sent and received messages',
@@ -4927,6 +5839,33 @@ def make_arg_parser():
         '--show-names',
         action='store_true',
         help="Show contacts' names next to messages, even in one-to-one conversations.",
+    )
+
+    parser.add_argument(
+        '--show-message-time',
+        nargs='?',
+        const='%H:%M',
+        default=False,
+        metavar='FORMAT',
+        help="Show messages' timestamps in the specified strftime %(metavar)s. (default %(metavar)s: %(const)r)",
+    )
+
+    parser.add_argument(
+        '--show-inline',
+        nargs='?',
+        default=False,
+        choices=('columns', 'wrap'),
+        const='columns',
+        help="Print message's elements (sender's name, message text, attachment list, etc) on a single line.",
+    )
+
+    parser.add_argument(
+        '--show-message-padding',
+        nargs='?',
+        const=' ',
+        default=False,
+        metavar='PAD',
+        help="Insert a line of %(metavar)r characters between consecutive messages (default %(metavar)s: %(const)r)",
     )
 
     parser.add_argument(
@@ -4962,26 +5901,30 @@ def make_arg_parser():
                 '-u %u '
                 '--output=json '
                 #'--trust-new-identities=always '  # requires s-cli v0.9.0+; does not notify of safety number change (see signal-cli#826)
-                'daemon'),
+                'daemon '
+                '--dbus '  # explicit daemon mode required since v0.13.0
+                ),
         help='Command for starting signal-cli daemon. The `%%u` in command will be replaced with username (phone number).',
     )
 
     parser.add_argument(
         '--no-daemon',
         action='store_true',
-        help='Do not start signal-cli daemon. Only useful for debugging scli.',
+        help='Do not start signal-cli daemon. Only useful for debugging %(prog)s.',
     )
 
     parser.add_argument(
         '--debug',
-        action='store_true',
-        help='Verbose log output.',
+        action='append_const',
+        const='debug',
+        dest='log_level',
+        help='Alias for --log-level=debug.',
     )
 
     parser.add_argument(
         '--version',
         action='version',
-        version='%(prog)s ' + __version__,
+        version=prog_version_str,
     )
 
     return parser
@@ -4989,13 +5932,15 @@ def make_arg_parser():
 
 def get_cfg_file_args(file_obj):
     # Alternatively, can override `ArgumentParser.convert_arg_line_to_args()`.
-    # Could use `configparser` module if the syntax gets more complicated.
     ret = {}
     for line in file_obj:
-        line = line.strip()
-        if not line or line.startswith('#'):
+        line = line.split('#', 1)[0].strip()
+        if not line:
             continue
-        name, _, val = line.partition("=")
+        try:
+            name, val = line.split('=', 1)
+        except ValueError:
+            sys.exit(f"scli: error: Could not parse config line {line!r}")
         ret[name.strip()] = val.strip()
     return ret
 
@@ -5004,7 +5949,7 @@ def get_opt_val_flags(parser):
     """Flags that optionally take values.
 
     These are defined by
-        ..., nargs='?', const=True, default=False, ...
+        ..., nargs='?', const=…, default=…, ...
     See
         https://docs.python.org/3/library/argparse.html#nargs
 
@@ -5020,51 +5965,73 @@ def get_opt_val_flags(parser):
         <nothing> (option not mentioned in config)
     """
 
-    # For these arguments, checking for the `False` values in the config file (e.g. 'false', 'f', 'no', etc) needs to be done explicitly, unlike for the regular flags that interpret any config value that is not in ('true', 't', 'yes', etc) as `False`.
-
     return frozenset(
-            opt
+            opt_str
             for a in parser._actions            # pylint: disable=protected-access
-            for opt in a.option_strings
             if (
                 a.nargs == argparse.OPTIONAL
-                and isinstance(a.const, bool)
-                and isinstance(a.default, bool)
+                and a.const is not None
+                and a.default is not None
                 )
+            for opt_str in a.option_strings
             )
 
 
+def get_args_with_actions(parser, action_names):
+    # pylint: disable=protected-access
+    act_class_map = {
+            'store': argparse._StoreAction,
+            'store_true': argparse._StoreTrueAction,
+            'append': argparse._AppendAction,
+            'append_const': argparse._AppendConstAction,
+            }
+    act_classes = tuple(act_class_map[an] for an in action_names)
+    ret = set()
+    for act in parser._actions:
+        if isinstance(act, act_classes):
+            ret.update(act.option_strings)
+    return ret
+
+
 def parse_cfg_file(parser, cli_args):
-    cfg_file_path = os.path.expanduser(cli_args.config_file)
+    cfg_file_path = Path(cli_args.config_file).expanduser()
     try:
         with open(cfg_file_path, encoding="utf-8") as cfg_f:
             cfg_f_args_dict = get_cfg_file_args(cfg_f)
     except FileNotFoundError:
         if cli_args.config_file == parser.get_default('config_file'):
             return cli_args
-        sys.exit("ERROR: Config file not found: " + cfg_file_path)
+        sys.exit(f"ERROR: Config file not found: {cfg_file_path}")
 
-    opt_val_flags = get_opt_val_flags(parser)
+    true_false_val_args = (
+            get_opt_val_flags(parser)
+            |
+            get_args_with_actions(
+                parser,
+                ("store_true", "append_const"),
+                )
+            )
     args_list = []
     for arg_name, arg_val in cfg_f_args_dict.items():
-        arg_dest = arg_name.replace('-', '_')   # Assuming `dest` has not been overriden.
-        if arg_dest not in cli_args:
-            print("WARNING: encountered an unrecognized argument while parsing config file:", arg_name, file=sys.stderr)
-            continue
-        arg_default = parser.get_default(arg_dest)
         arg_name = '--' + arg_name
-        if isinstance(arg_default, bool):
+        if arg_name in true_false_val_args:
             if arg_val.lower() in ('true', 't', 'yes', 'y'):
                 args_list.append(arg_name)
-            elif (
-                    arg_name in opt_val_flags
-                    and arg_val.lower() not in ('false', 'f', 'no', 'n')
-                    ):
+            elif arg_val.lower() not in ('false', 'f', 'no', 'n'):
                 args_list.extend((arg_name, arg_val))
         else:
             args_list.extend((arg_name, arg_val))
+
     # Need to actually parse the arguments (rather then simply updating args.__dict__), so that the `type`s would be set correctly.
-    cfg_file_args = parser.parse_args(args_list)
+    exit_on_error_orig = parser.exit_on_error
+    parser.exit_on_error = False
+    try:
+        cfg_file_args = parser.parse_args(args_list)
+    except argparse.ArgumentError:
+        args_str = ' '.join([repr(a) if not a else a for a in args_list])
+        parser.exit(f"scli: error: Could not parse config file `{cfg_file_path}` arguments: {args_str!r}")
+    finally:
+        parser.exit_on_error = exit_on_error_orig
     parser.parse_args(namespace=cfg_file_args)
     return cfg_file_args
 
@@ -5099,16 +6066,105 @@ def parse_args():
 
     if args.config_file:
         args = parse_cfg_file(parser, args)
-    if args.editor_command is None:
-        args.editor_command = get_default_editor()
-    if not args.username:
-        args.username = detect_user_name()
+    modified_args = {arg: val for arg, val in vars(args).items() if val != parser.get_default(arg)}
+
+    args.editor_command = args.editor_command or get_default_editor()
+    args.pager_command = args.pager_command or get_default_pager()
+    args.username = args.username or detect_username()
     if args.color:
         args.color = Color(args.color)
+    if args.save_history:
+        args.save_history = os.path.expanduser(args.save_history)
+    args.wrap_at = parse_wrap_at_arg(args.wrap_at)
+    if args.group_contacts:
+        print("Warning: `--group-contacts` option is deprecated; use `--partition-constants` instead.")
     args.partition_contacts = args.partition_contacts or args.group_contacts
     del args.__dict__['group_contacts']
-    args.wrap_at = parse_wrap_at_arg(args.wrap_at)
-    return args
+    if args.clipboard_put_command and "%s" in args.clipboard_put_command:
+        print("Warning: `--clipboard-put-command` does not use replacement tokens ('%s'). See `--help`.")
+    return args, modified_args
+
+
+# #############################################################################
+# logging
+# #############################################################################
+
+
+class DeferredEval:
+
+    __slots__ = ("func", "args", "kwargs")
+
+    def __init__(self, func, *args, **kwargs):
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+
+    def __str__(self):
+        return self.func(*self.args, **self.kwargs)
+
+
+def parse_log_level_args(args_append_list, sep=':', def_key=Path(__file__).stem):
+    """Parse values of `--log-level` arguments.
+
+    The values are "LOGGER:LOG_LEV", where LOGGER is one of the loggers registered with the logging module: urwid, asyncio, scli (this module), etc. Example: `--log-level urwid:warning`. Values can also be just LOG_LEV (e.g. `--log-level info`), in which case LOGGER is set to "scli". A special LOGGER name "all" sets levels for all of the registered loggers.
+    """
+    arg_map = {}
+    for arg in args_append_list:
+        try:
+            k, v = arg.split(sep, 1)
+        except ValueError:
+            k = def_key
+            v = arg
+        if k == "all":
+            arg_map.clear()
+        with suppress(AttributeError):
+            v = getattr(logging, v.upper())
+        arg_map[k] = v
+    with suppress(KeyError):
+        arg_map.setdefault("Daemon", arg_map[def_key])
+    return arg_map
+
+
+def logging_levels_list():
+    """Get the list of `logging` module's built-in log levels."""
+    # Python 3.11 introduced `logging.getLevelNamesMapping()`.
+    return [logging.getLevelName(n).lower() for n in range(
+            logging.DEBUG,      # == 10
+            logging.CRITICAL + logging.DEBUG,  # +10, for `range`'s non-inclusive upper limit
+            logging.WARNING - logging.INFO,     # == 10
+            )]
+
+
+def set_daemon_verbose_level(vs):
+    prog_name = "signal-cli"
+    cfg.daemon_command = cfg.daemon_command.replace(  # pylint: disable=attribute-defined-outside-init
+            prog_name,
+            f"{prog_name} -{vs}",
+            1,
+            )
+
+
+def logging_setup(filename, levels):
+    log_levels = parse_log_level_args(levels)
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+            filename=filename,
+            level=log_levels.pop("all"),
+            )
+    try:
+        log_lev_daemon = log_levels.pop("signal-cli")
+    except KeyError:
+        pass
+    else:
+        set_daemon_verbose_level(log_lev_daemon)
+    for logger_name, log_lev in log_levels.items():
+        logging.getLogger(logger_name).setLevel(log_lev)
+    logger.info(DeferredEval(prog_version_str))
+    logger.info("urwid %s", urwid.__version__)
+    logger.info("python %s", DeferredEval(get_python_version))
+
+
+logger = logging.getLogger(Path(__file__).stem)
 
 
 # #############################################################################
@@ -5166,7 +6222,7 @@ def link_device(device_name):
 
     print('Receiving data for the first time...')
 
-    cmd_receive = 'signal-cli -u {} receive'.format(detect_user_name())
+    cmd_receive = 'signal-cli -u {} receive'.format(detect_username())
     with subprocess.Popen(
             cmd_receive.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             ) as proc_receive:
@@ -5183,43 +6239,33 @@ def link_device(device_name):
     sys.exit(0)
 
 
-def detect_user_name():
-    ulist = []
-    for folder in [SIGNALCLI_DATA_FOLDER, SIGNALCLI_LEGACY_DATA_FOLDER]:
-        try:
-            users = [x for x in os.listdir(folder) if os.path.isfile(os.path.join(folder, x))]
-            ulist.extend(users)
-        except FileNotFoundError:
-            pass
+def detect_username():
+    accounts = [acc["number"] for acc in SignalData.parse_accounts_json()]
 
-    if not ulist:
+    if not accounts:
         sys.exit("ERROR: Could not find any registered accounts. "
                 "Register a new one or link with an existing device (see README).")
-    elif len(ulist) == 1:
-        return ulist[0]
+    elif len(accounts) == 1:
+        return accounts[0]
     else:
         sys.exit("ERROR: Multiple accounts found. Run one of:\n\t"
-                + "\n\t".join((f"scli --username={u}" for u in ulist)))
+                + "\n\t".join((f"scli --username={u}" for u in accounts)))
 
 
 def main():
-    try:
-        os.makedirs(SCLI_ATTACHMENT_FOLDER)
-    except OSError as exc:
-        if not (exc.errno == errno.EEXIST and os.path.isdir(SCLI_DATA_FOLDER)):
-            sys.exit("ERROR: Could not create a directory in " + SCLI_DATA_FOLDER)
+    args, modified_args = parse_args()
+    cfg.set(args)
 
-    args = parse_args()
-
-    if args.debug:
-        logging.basicConfig(filename=args.log_file, level=logging.DEBUG)
-    elif args.save_history or args.log_file != SCLI_LOG_FILE:
-        logging.basicConfig(filename=args.log_file, level=logging.WARNING)
+    if any(arg in modified_args for arg in (
+            "log_file",
+            "log_level",
+            )):
+        logging_setup(filename=args.log_file, levels=args.log_level)
     else:
         logging.disable()
-    logging.info("scli %s", __version__)
+    logger.debug("args = %s", DeferredEval(pprint.pformat, modified_args))
 
-    cfg.set(args)
+    KEY_BINDINGS.set(args.key_bind)
 
     coord = Coordinate()
     loop = coord.daemon.main_loop
@@ -5235,8 +6281,6 @@ def main():
     with BracketedPasteMode():
         loop.run()
 
-
-__version__ = get_version()
 
 if __name__ == "__main__":
     main()

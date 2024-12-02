@@ -1,0 +1,60 @@
+name: draft-release
+
+on:
+  push:
+    tags:
+      - v*
+
+
+jobs:
+
+  prepare_release:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout this repo sources
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Create repo archive
+        # Make a static tarball with a checksum that does not change between downloads. This will ease packaging: see #143, #151.
+        id: git_archive
+        env:
+          PROJ_NAME: ${{ github.event.repository.name }}
+          REF_NAME: ${{ github.ref_name }}
+          EXT: tar.gz
+        run: |
+          filename=${PROJ_NAME}-${REF_NAME}.${EXT}
+          git archive -o "$filename" "$REF_NAME"
+          echo "filename=$filename" >> $GITHUB_OUTPUT
+
+      - name: Get annotated tag's message
+        id: tag_msg
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          #git cat-file -p "$REF_NAME" | tail -n +8
+          {
+            echo 'msg<<EOF'
+            git tag -l "$REF_NAME" --format='%(contents:body)'
+              # Returns an empty string for non-annotated (ligthweight) tags.
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create new release draft
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+          TAG_MSG: ${{ steps.tag_msg.outputs.msg }}
+          GIT_ARCHIVE_FILE: ${{ steps.git_archive.outputs.filename }}
+        run: |
+          gh release create \
+            --draft \
+            --verify-tag \
+            --notes "$TAG_MSG" \
+            --title "$REF_NAME" \
+            "$REF_NAME" \
+            "$GIT_ARCHIVE_FILE"
